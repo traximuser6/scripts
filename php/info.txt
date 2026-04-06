@@ -1,0 +1,7 @@
+yeh powershell script wampp men mojood sary php ke versions ko leta hai or c:/scripts directlry men sab files ki bat files bnata hai, wo batch files php composer or php ke versions ko manage krny men kaam ati hen
+
+
+
+ham comp85 install likh ke php 8.5 se dependendcies install kr sakty hen, 
+
+or kisi b laravel php project ko specific php verison men serve kr sakty hen
