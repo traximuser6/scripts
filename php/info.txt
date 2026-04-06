@@ -5,3 +5,6 @@ yeh powershell script wampp men mojood sary php ke versions ko leta hai or c:/sc
 ham comp85 install likh ke php 8.5 se dependendcies install kr sakty hen, 
 
 or kisi b laravel php project ko specific php verison men serve kr sakty hen
+
+
+phir us ke baad confirmation-scirpt admininistrator account men chala den
