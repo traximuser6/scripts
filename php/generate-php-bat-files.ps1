@@ -1,7 +1,8 @@
 # 1. Paths define karein
 $phpSourceDir = "C:\wamp64\bin\php"
 $scriptDestDir = "C:\scripts\php"
-$composerPath = "C:\ProgramData\ComposerSetup\bin\composer.phar" # Check if this is correct
+# Composer path verify karlein (usually yahan hota hai)
+$composerPath = "C:\ProgramData\ComposerSetup\bin\composer.phar" 
 
 # 2. Destination folder banayein agar nahi hai to
 if (!(Test-Path $scriptDestDir)) {
@@ -13,25 +14,29 @@ if (!(Test-Path $scriptDestDir)) {
 $phpFolders = Get-ChildItem -Path $phpSourceDir -Directory -Filter "php*"
 
 foreach ($folder in $phpFolders) {
-    # Version nikalna (e.g., 8.5)
-    $versionFull = $folder.Name.Replace("php", "") # e.g. 8.5.0
-    $versionShort = $versionFull.Split('.')[0] + $versionFull.Split('.')[1] # e.g. 85
-
-    $phpExe = Join-Path $folder.FullName "php.exe"
-    
-    if (Test-Path $phpExe) {
-        # --- PHP Batch File (e.g. php85.bat) ---
-        $phpBatFile = Join-Path $scriptDestDir "php$versionShort.bat"
-        "@echo off`n`"$phpExe`" %*" | Out-File -FilePath $phpBatFile -Encoding ascii
+    # Version nikalna (e.g., 8.2.29 -> 82)
+    $versionParts = $folder.Name.Replace("php", "").Split('.')
+    if ($versionParts.Count -ge 2) {
+        $versionShort = $versionParts[0] + $versionParts[1] # e.g. 82
+        $versionFull = $folder.Name.Replace("php", "")
         
-        # --- Composer Batch File (e.g. comp85.bat) ---
-        $compBatFile = Join-Path $scriptDestDir "comp$versionShort.bat"
-        if (Test-Path $composerPath) {
-            "@echo off`n`"$phpExe`" `"$composerPath`" %*" | Out-File -FilePath $compBatFile -Encoding ascii
-        }
+        $phpExe = Join-Path $folder.FullName "php.exe"
+        
+        if (Test-Path $phpExe) {
+            # --- PHP Batch File (e.g. php82.bat) ---
+            $phpBatFile = Join-Path $scriptDestDir "php$versionShort.bat"
+            "@echo off`n`"$phpExe`" %*" | Out-File -FilePath $phpBatFile -Encoding ascii
+            
+            # --- Composer Batch File (Ab yeh cmp82.bat banay ga) ---
+            $compBatFile = Join-Path $scriptDestDir "cmp$versionShort.bat"
+            if (Test-Path $composerPath) {
+                "@echo off`n`"$phpExe`" `"$composerPath`" %*" | Out-File -FilePath $compBatFile -Encoding ascii
+            }
 
-        Write-Host "🚀 Generated: php$versionShort.bat & comp$versionShort.bat for v$versionFull" -ForegroundColor Cyan
+            Write-Host "🚀 Generated: php$versionShort.bat & cmp$versionShort.bat for v$versionFull" -ForegroundColor Cyan
+        }
     }
 }
 
-Write-Host "`n🔥 All set! Now just add '$scriptDestDir' to your System PATH." -ForegroundColor Yellow
+Write-Host "`n🔥 All set! 'cmp' prefix applied." -ForegroundColor Yellow
+Write-Host "👉 Ab 'C:\scripts\php' ko System PATH mein add kar ke terminal restart karein." -ForegroundColor White
