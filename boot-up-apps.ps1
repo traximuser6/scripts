@@ -1,33 +1,33 @@
-# --- Developer Workspace Bootstrapper ---
-# CRITICAL: Add this at the VERY TOP to prevent window from closing
-$global:ErrorActionPreference = 'Continue'
+# Check if running with proper permissions
+if (-not ([Security.Principal.WindowsPrincipal] [Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole] "Administrator"))
+{
+    $scriptPath = $MyInvocation.MyCommand.Path
+    if ($scriptPath)
+    {
+        Start-Process powershell.exe -ArgumentList "-NoProfile -ExecutionPolicy Bypass -File `"$scriptPath`"" -Verb RunAs
+        exit
+    }
+}
+
+$host.UI.RawUI.WindowTitle = "Developer Workspace Bootstrapper"
+$ErrorActionPreference = "Continue"
+
 trap
 {
-    Write-Host "`n[!!!] FATAL ERROR OCCURRED !!!" -ForegroundColor Red -BackgroundColor Yellow
+    Write-Host "`n========================================" -ForegroundColor Red -BackgroundColor Yellow
+    Write-Host "   CRITICAL ERROR DETECTED               " -ForegroundColor Red -BackgroundColor Yellow
+    Write-Host "=========================================" -ForegroundColor Red -BackgroundColor Yellow
     Write-Host "Error: $_" -ForegroundColor Red
-    Write-Host "`nScript will stay open. Press any key to exit..." -ForegroundColor Yellow
+    Write-Host "Line: $($_.InvocationInfo.ScriptLineNumber)" -ForegroundColor Red
+    Write-Host "Category: $($_.Exception.GetType().Name)" -ForegroundColor Red
+    Write-Host "`nThe window will stay open. Review error above." -ForegroundColor Yellow
+    Write-Host "Press any key to exit..." -ForegroundColor Yellow
     $null = $Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown")
     continue
 }
 
-# Force window to stay open
-$host.UI.RawUI.WindowTitle = "Developer Workspace Bootstrapper - DO NOT CLOSE"
-
-# Try to set execution policy for this session only
 try
-{
-    Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass -Force -ErrorAction SilentlyContinue
-} catch
-{
-}
-
-# Clear host safely
-try
-{
-    if ($Host.UI.RawUI.WindowSize.Width -gt 0)
-    {
-        Clear-Host
-    }
+{ Clear-Host
 } catch
 {
 }
@@ -38,10 +38,9 @@ Write-Host "===============================================" -ForegroundColor Ye
 Write-Host "Started at: $(Get-Date -Format 'HH:mm:ss')" -ForegroundColor White
 Write-Host ""
 
-# --- Error Collection ---
 $Errors = @()
+$TotalStart = Get-Date
 
-# --- Required Tabs List ---
 $RequiredTabs = @(
     "https://mail.google.com/mail/u/0/#inbox",
     "https://app.clickup.com/t/36243627/868hw5g9y",
@@ -58,491 +57,180 @@ $RequiredTabs = @(
 
 function Safe-Execute
 {
-    param(
-        [scriptblock]$ScriptBlock,
-        [string]$OperationName
-    )
-
+    param([scriptblock]$Code, [string]$Name)
     try
     {
-        & $ScriptBlock
-        return $true
+        & $Code
     } catch
     {
-        $errorMsg = "[!] $OperationName failed: $($_.Exception.Message)"
-        $Errors += $errorMsg
-        Write-Host $errorMsg -ForegroundColor Red
-        return $false
+        $msg = "[!] $Name failed: $($_.Exception.Message)"
+        $Errors += $msg
+        Write-Host $msg -ForegroundColor Red
     }
 }
 
-function Ensure-ChromeTabs
+function Start-AppSafe
 {
-    param ([array]$Urls)
+    param([string]$Name, [string]$Path, [string]$Args = "")
 
-    Write-Host "`n[>] Setting up Chrome tabs..." -ForegroundColor Cyan
-
-    $debugPort = 9222
-    $chromeStarted = $false
-
-    # Check if debug port is already in use
-    try
-    {
-        $chromeDebug = netstat -ano 2>$null | Select-String ":$debugPort"
-        if ($chromeDebug)
-        {
-            Write-Host "[-] Chrome debug port already active" -ForegroundColor Gray
-        } else
-        {
-            Write-Host "[*] Starting Chrome with debugging port $debugPort..." -ForegroundColor Yellow
-            Stop-Process -Name chrome -Force -ErrorAction SilentlyContinue
-            Start-Sleep -Seconds 2
-
-            $chromePath = @(
-                "${env:ProgramFiles}\Google\Chrome\Application\chrome.exe",
-                "${env:ProgramFiles(x86)}\Google\Chrome\Application\chrome.exe",
-                "$env:LOCALAPPDATA\Google\Chrome\Application\chrome.exe"
-            )
-
-            $found = $false
-            foreach ($path in $chromePath)
-            {
-                if (Test-Path $path)
-                {
-                    Start-Process $path "--remote-debugging-port=$debugPort --no-first-run --no-default-browser-check"
-                    $found = $true
-                    break
-                }
-            }
-
-            if (-not $found)
-            {
-                try
-                {
-                    Start-Process "chrome.exe" "--remote-debugging-port=$debugPort --no-first-run --no-default-browser-check"
-                    $found = $true
-                } catch
-                {
-                    Write-Host "[!] Could not find Chrome executable" -ForegroundColor Red
-                    $Errors += "Chrome not found"
-                }
-            }
-
-            if ($found)
-            {
-                Start-Sleep -Seconds 4
-                $chromeStarted = $true
-            }
-        }
-    } catch
-    {
-        Write-Host "[!] Error checking Chrome debug port: $($_.Exception.Message)" -ForegroundColor Red
-        $Errors += "Chrome debug check failed"
-    }
-
-    # Try to manage tabs via API
-    $apiWorked = $false
-    try
-    {
-        $tabs = Invoke-RestMethod "http://localhost:$debugPort/json" -TimeoutSec 10 -ErrorAction Stop
-        $openedCount = 0
-        $closedCount = 0
-
-        Write-Host "[*] Managing tabs via Chrome DevTools API..." -ForegroundColor Cyan
-
-        foreach ($url in $Urls)
-        {
-            try
-            {
-                $exists = $tabs | Where-Object { $_.url -eq $url -or $_.url.StartsWith($url.Split("?")[0]) }
-
-                if ($exists)
-                {
-                    Write-Host "[-] Already open: $($url.Substring(0, [Math]::Min(50, $url.Length)))" -ForegroundColor Gray
-                } else
-                {
-                    Write-Host "[+] Opening: $($url.Substring(0, [Math]::Min(50, $url.Length)))" -ForegroundColor Cyan
-                    Start-Process "chrome.exe" $url -ErrorAction SilentlyContinue
-                    $openedCount++
-                    Start-Sleep -Milliseconds 300
-                }
-            } catch
-            {
-                Write-Host "[!] Error opening tab: $($_.Exception.Message)" -ForegroundColor Red
-                $Errors += "Failed to open: $url"
-            }
-        }
-
-        # Close extra tabs
-        Write-Host "[*] Checking for extra tabs to close..." -ForegroundColor Yellow
-        foreach ($tab in $tabs)
-        {
-            if ($tab.url -and $tab.id)
-            {
-                $isRequired = $Urls | Where-Object { $tab.url -eq $_ -or $tab.url.StartsWith($_.Split("?")[0]) }
-
-                if (-not $isRequired)
-                {
-                    $title = if ($tab.title)
-                    { $tab.title.Substring(0, [Math]::Min(40, $tab.title.Length))
-                    } else
-                    { "Unknown"
-                    }
-                    Write-Host "[-] Closing: $title" -ForegroundColor DarkGray
-                    try
-                    {
-                        Invoke-RestMethod -Uri "http://localhost:$debugPort/json/close/$($tab.id)" -Method Get -TimeoutSec 5 -ErrorAction SilentlyContinue
-                        $closedCount++
-                    } catch
-                    {
-                    }
-                }
-            }
-        }
-
-        Write-Host "[✓] Tabs synchronized: $openedCount opened, $closedCount closed" -ForegroundColor Green
-        $apiWorked = $true
-
-    } catch
-    {
-        Write-Host "[!] Chrome API not available, using fallback method..." -ForegroundColor Yellow
-        $Errors += "Chrome API unavailable: $($_.Exception.Message)"
-    }
-
-    # Fallback: Just open all tabs
-    if (-not $apiWorked)
-    {
-        Write-Host "[*] Opening all required tabs..." -ForegroundColor Cyan
-        foreach ($url in $Urls)
-        {
-            try
-            {
-                Write-Host "[+] Opening: $($url.Substring(0, [Math]::Min(50, $url.Length)))" -ForegroundColor Cyan
-                Start-Process "chrome.exe" $url -ErrorAction SilentlyContinue
-                Start-Sleep -Milliseconds 300
-            } catch
-            {
-                Write-Host "[!] Failed to open: $url" -ForegroundColor Red
-                $Errors += "Failed to open: $url"
-            }
-        }
-    }
-}
-
-function Start-AppWithTimer
-{
-    param (
-        [string]$ProcessName,
-        [string]$FilePath,
-        [string]$DisplayName,
-        [string]$ArgumentList = ""
-    )
-
-    Write-Host "[>] Checking $DisplayName..." -ForegroundColor Cyan
+    Write-Host "[>] Checking $Name..." -ForegroundColor Cyan
 
     try
     {
-        $check = Get-Process -Name $ProcessName -ErrorAction SilentlyContinue
-    } catch
-    {
-        $check = $null
-    }
-
-    if ($check)
-    {
-        Write-Host "[-] $DisplayName already running." -ForegroundColor Gray
-        return
-    }
-
-    # Check if file exists
-    if (-not (Test-Path $FilePath))
-    {
-        # Try to find it in PATH
-        try
+        $procName = (Split-Path $Path -Leaf).Replace(".exe","")
+        $proc = Get-Process -Name $procName -ErrorAction SilentlyContinue
+        if ($proc)
         {
-            $cmd = Get-Command $FilePath -ErrorAction SilentlyContinue
-            if ($cmd)
-            {
-                $FilePath = $cmd.Source
-            } else
-            {
-                Write-Host "[!] $DisplayName not found at: $FilePath" -ForegroundColor Yellow
-                $Errors += "$DisplayName not found"
-                return
-            }
-        } catch
-        {
-            Write-Host "[!] $DisplayName not found at: $FilePath" -ForegroundColor Yellow
-            $Errors += "$DisplayName not found"
+            Write-Host "[-] $Name already running" -ForegroundColor Gray
             return
         }
-    }
-
-    Write-Host "[+] Launching $DisplayName..." -ForegroundColor Cyan -NoNewline
-    try
-    {
-        if ($ArgumentList -ne "")
-        {
-            Start-Process $FilePath -ArgumentList $ArgumentList -WindowStyle Minimized -ErrorAction Stop
-        } else
-        {
-            Start-Process $FilePath -WindowStyle Normal -ErrorAction Stop
-        }
-        Start-Sleep -Seconds 1
-        Write-Host " Done!" -ForegroundColor Green
     } catch
     {
-        Write-Host " Failed!" -ForegroundColor Red
-        Write-Host "    Error: $($_.Exception.Message)" -ForegroundColor Red
-        $Errors += "$DisplayName launch failed: $($_.Exception.Message)"
+    }
+
+    if (Test-Path $Path)
+    {
+        Write-Host "[+] Launching $Name..." -ForegroundColor Cyan -NoNewline
+        try
+        {
+            if ($Args)
+            {
+                Start-Process $Path -ArgumentList $Args -WindowStyle Minimized -ErrorAction Stop
+            } else
+            {
+                Start-Process $Path -WindowStyle Minimized -ErrorAction Stop
+            }
+            Start-Sleep 1
+            Write-Host " Done!" -ForegroundColor Green
+        } catch
+        {
+            Write-Host " Failed!" -ForegroundColor Red
+            $Errors += "$Name launch failed: $($_.Exception.Message)"
+        }
+    } else
+    {
+        Write-Host "[!] $Name not found at: $Path" -ForegroundColor Yellow
+        $Errors += "$Name not found"
     }
 }
 
-# ============================================
-# MAIN EXECUTION
-# ============================================
-
-Write-Host "`n========================================" -ForegroundColor Yellow
-Write-Host "  STEP 1: Docker Engine" -ForegroundColor White
-Write-Host "========================================" -ForegroundColor Yellow
-
+Write-Host "`n[1/12] Docker Desktop" -ForegroundColor White
 Safe-Execute {
-    $dockerPath = "C:\Program Files\Docker\Docker\Docker Desktop.exe"
-    if (Test-Path $dockerPath)
-    {
-        Start-AppWithTimer -ProcessName "Docker Desktop" -FilePath $dockerPath -DisplayName "Docker Desktop"
-        Start-Sleep -Seconds 3
-    } else
-    {
-        Write-Host "[!] Docker Desktop not found" -ForegroundColor Yellow
-        $Errors += "Docker Desktop not found"
-    }
-} "Docker Engine Check"
+    Start-AppSafe "Docker Desktop" "C:\Program Files\Docker\Docker\Docker Desktop.exe"
+    Start-Sleep 3
+} "Docker"
 
-Write-Host "`n========================================" -ForegroundColor Yellow
-Write-Host "  STEP 2: Docker Containers" -ForegroundColor White
-Write-Host "========================================" -ForegroundColor Yellow
-
+Write-Host "`n[2/12] Docker Containers" -ForegroundColor White
 Safe-Execute {
-    $originalPath = Get-Location
-    $dockerDir = "C:\scripts\docker-sql-server"
-
-    if (Test-Path $dockerDir)
+    if (Test-Path "C:\scripts\docker-sql-server")
     {
-        Set-Location $dockerDir
-
+        Push-Location "C:\scripts\docker-sql-server"
         try
         {
-            $dockerCheck = docker ps -q --filter "name=sql-server" 2>$null
-
-            if (!$dockerCheck)
+            $running = docker ps -q --filter "name=sql-server" 2>$null
+            if (-not $running)
             {
                 Write-Host "[+] Starting containers..." -ForegroundColor Cyan
-                $composeOutput = docker-compose up -d 2>&1
-                if ($LASTEXITCODE -ne 0)
-                {
-                    Write-Host "[!] Docker-compose failed!" -ForegroundColor Red
-                    Write-Host $composeOutput -ForegroundColor Red
-                    $Errors += "Docker-compose failed"
-                } else
-                {
-                    Write-Host "[✓] Containers started" -ForegroundColor Green
-                }
+                docker-compose up -d 2>&1 | Out-Null
+                Write-Host "[✓] Containers started" -ForegroundColor Green
             } else
             {
-                Write-Host "[-] Containers already active" -ForegroundColor Gray
+                Write-Host "[-] Already running" -ForegroundColor Gray
             }
         } catch
         {
-            Write-Host "[!] Docker command failed: $($_.Exception.Message)" -ForegroundColor Red
-            $Errors += "Docker command failed"
+            Write-Host "[!] Docker error: $($_.Exception.Message)" -ForegroundColor Red
+            $Errors += "Docker containers failed: $($_.Exception.Message)"
         }
-
-        Set-Location $originalPath
+        Pop-Location
     } else
     {
-        Write-Host "[!] Docker directory not found: $dockerDir" -ForegroundColor Yellow
-        $Errors += "Docker directory not found"
+        Write-Host "[!] Docker folder not found" -ForegroundColor Yellow
+        $Errors += "Docker folder not found"
     }
-} "Docker Containers"
+} "Containers"
 
-Write-Host "`n========================================" -ForegroundColor Yellow
-Write-Host "  STEP 3: Mailpit" -ForegroundColor White
-Write-Host "========================================" -ForegroundColor Yellow
-
+Write-Host "`n[3/12] Mailpit" -ForegroundColor White
 Safe-Execute {
-    $mailpitPath = "C:\scripts\mailpit-windows-amd64\mailpit.exe"
-    if (Test-Path $mailpitPath)
-    {
-        Write-Host "[+] Launching Mailpit..." -ForegroundColor Cyan -NoNewline
-        Start-Process $mailpitPath -WindowStyle Minimized -ErrorAction Stop
-        Start-Sleep -Seconds 2
-        Write-Host " Done!" -ForegroundColor Green
-    } else
-    {
-        Write-Host "[!] Mailpit not found" -ForegroundColor Yellow
-        $Errors += "Mailpit not found"
-    }
-} "Mailpit Launch"
+    Start-AppSafe "Mailpit" "C:\scripts\mailpit-windows-amd64\mailpit.exe"
+} "Mailpit"
 
-Write-Host "`n========================================" -ForegroundColor Yellow
-Write-Host "  STEP 4: Chrome Browser" -ForegroundColor White
-Write-Host "========================================" -ForegroundColor Yellow
+Write-Host "`n[4/12] Chrome" -ForegroundColor White
+Start-AppSafe "Chrome" "chrome.exe"
 
-Start-AppWithTimer -ProcessName "chrome" -FilePath "chrome.exe" -DisplayName "Google Chrome"
-Start-Sleep -Seconds 2
+Start-Sleep 2
 
-Write-Host "`n========================================" -ForegroundColor Yellow
-Write-Host "  STEP 5: Chrome Tabs" -ForegroundColor White
-Write-Host "========================================" -ForegroundColor Yellow
-
-Ensure-ChromeTabs $RequiredTabs
-
-Write-Host "`n========================================" -ForegroundColor Yellow
-Write-Host "  STEP 6: Brave Browser" -ForegroundColor White
-Write-Host "========================================" -ForegroundColor Yellow
-
-Start-AppWithTimer -ProcessName "brave" -FilePath "brave.exe" -DisplayName "Brave Browser"
-
-Write-Host "`n========================================" -ForegroundColor Yellow
-Write-Host "  STEP 7: WAMP Server" -ForegroundColor White
-Write-Host "========================================" -ForegroundColor Yellow
-
+Write-Host "`n[5/12] Chrome Tabs" -ForegroundColor White
 Safe-Execute {
-    $wampPath = "C:\wamp64\wampmanager.exe"
-    if (Test-Path $wampPath)
+    Write-Host "[+] Opening tabs..." -ForegroundColor Cyan
+    foreach ($url in $RequiredTabs)
     {
-        Start-AppWithTimer -ProcessName "wampmanager" -FilePath $wampPath -DisplayName "WAMP Server"
-    } else
-    {
-        Write-Host "[!] WAMP Server not found" -ForegroundColor Yellow
-        $Errors += "WAMP Server not found"
-    }
-} "WAMP Server"
-
-Write-Host "`n========================================" -ForegroundColor Yellow
-Write-Host "  STEP 8: Bruno" -ForegroundColor White
-Write-Host "========================================" -ForegroundColor Yellow
-
-Safe-Execute {
-    $brunoPath = "$env:LocalAppData\Programs\bruno\bruno.exe"
-    if (Test-Path $brunoPath)
-    {
-        Write-Host "[+] Launching Bruno..." -ForegroundColor Cyan -NoNewline
-        Start-Process $brunoPath -WindowStyle Minimized -ErrorAction Stop
-        Start-Sleep 1
-        Write-Host " Done!" -ForegroundColor Green
-    } else
-    {
-        Write-Host "[!] Bruno not found" -ForegroundColor Yellow
-        $Errors += "Bruno not found"
-    }
-} "Bruno Launch"
-
-Write-Host "`n========================================" -ForegroundColor Yellow
-Write-Host "  STEP 9: VS Code" -ForegroundColor White
-Write-Host "========================================" -ForegroundColor Yellow
-
-Start-AppWithTimer -ProcessName "Code" -FilePath "code" -DisplayName "VS Code"
-
-Write-Host "`n========================================" -ForegroundColor Yellow
-Write-Host "  STEP 10: Google Teams (Web)" -ForegroundColor White
-Write-Host "========================================" -ForegroundColor Yellow
-
-Safe-Execute {
-    Write-Host "[+] Opening Google Teams..." -ForegroundColor Cyan -NoNewline
-    Start-Process "chrome.exe" "https://teams.google.com" -ErrorAction Stop
-    Start-Sleep 1
-    Write-Host " Done!" -ForegroundColor Green
-} "Google Teams"
-
-Write-Host "`n========================================" -ForegroundColor Yellow
-Write-Host "  STEP 11: Microsoft Teams" -ForegroundColor White
-Write-Host "========================================" -ForegroundColor Yellow
-
-Safe-Execute {
-    $teamsRunning = Get-Process -Name "ms-teams" -ErrorAction SilentlyContinue
-
-    if (-not $teamsRunning)
-    {
-        $teamsNew = "$env:LocalAppData\Microsoft\WindowsApps\ms-teams.exe"
-        $teamsOld = "$env:LocalAppData\Microsoft\Teams\Update.exe"
-
-        if (Test-Path $teamsNew)
+        try
         {
-            Write-Host "[+] Launching Teams..." -ForegroundColor Cyan -NoNewline
-            Start-Process $teamsNew -ErrorAction Stop
-            Start-Sleep 2
-            Write-Host " Done!" -ForegroundColor Green
-        } elseif (Test-Path $teamsOld)
+            Start-Process "chrome.exe" $url -ErrorAction SilentlyContinue
+            Start-Sleep -Milliseconds 200
+        } catch
         {
-            Write-Host "[+] Launching Teams (old version)..." -ForegroundColor Cyan -NoNewline
-            Start-Process $teamsOld -ArgumentList "--processStart", "Teams.exe" -ErrorAction Stop
-            Start-Sleep 2
-            Write-Host " Done!" -ForegroundColor Green
-        } else
-        {
-            Write-Host "[!] Microsoft Teams not found" -ForegroundColor Yellow
-            $Errors += "Teams not found"
         }
+    }
+    Write-Host "[✓] Tabs opened" -ForegroundColor Green
+} "Tabs"
+
+Write-Host "`n[6/12] Brave" -ForegroundColor White
+Start-AppSafe "Brave" "brave.exe"
+
+Write-Host "`n[7/12] WAMP" -ForegroundColor White
+Start-AppSafe "WAMP" "C:\wamp64\wampmanager.exe"
+
+Write-Host "`n[8/12] Bruno" -ForegroundColor White
+Start-AppSafe "Bruno" "$env:LocalAppData\Programs\bruno\bruno.exe"
+
+Write-Host "`n[9/12] VS Code" -ForegroundColor White
+Start-AppSafe "VS Code" "code"
+
+Write-Host "`n[10/12] Google Teams" -ForegroundColor White
+Safe-Execute {
+    Write-Host "[+] Opening Google Teams..." -ForegroundColor Cyan
+    Start-Process "chrome.exe" "https://teams.google.com" -ErrorAction SilentlyContinue
+} "GTeams"
+
+Write-Host "`n[11/12] MS Teams" -ForegroundColor White
+Safe-Execute {
+    $teams = "$env:LocalAppData\Microsoft\WindowsApps\ms-teams.exe"
+    if (Test-Path $teams)
+    {
+        Start-AppSafe "MS Teams" $teams
     } else
     {
-        Write-Host "[-] Teams already running" -ForegroundColor Gray
+        Write-Host "[-] Teams not found" -ForegroundColor Yellow
+        $Errors += "MS Teams not found"
     }
-} "Microsoft Teams"
+} "MSTeams"
 
-Write-Host "`n========================================" -ForegroundColor Yellow
-Write-Host "  STEP 12: Close Docker UI" -ForegroundColor White
-Write-Host "========================================" -ForegroundColor Yellow
-
+Write-Host "`n[12/12] Close Docker UI" -ForegroundColor White
 Safe-Execute {
-    Write-Host "[>] Closing Docker Desktop UI..." -ForegroundColor Cyan
     Stop-Process -Name "Docker Desktop" -Force -ErrorAction SilentlyContinue
-    Start-Sleep -Seconds 1
-    Write-Host "[-] Docker UI closed (containers still running)" -ForegroundColor Green
-} "Close Docker UI"
+    Write-Host "[-] Docker UI closed" -ForegroundColor Green
+} "DockerUI"
 
-# ============================================
-# FINAL SUMMARY
-# ============================================
-
-$TotalEnd = Get-Date
-$Duration = $TotalEnd - $TotalStart
+$Duration = (Get-Date) - $TotalStart
 
 Write-Host "`n===============================================" -ForegroundColor Yellow
-Write-Host "   ✓ BOOTSTRAP COMPLETE!                       " -ForegroundColor Green -BackgroundColor DarkGreen
+Write-Host "  ✓ BOOTSTRAP COMPLETE - WAITING 5 SECONDS     " -ForegroundColor Green -BackgroundColor DarkGreen
 Write-Host "===============================================" -ForegroundColor Yellow
-Write-Host "Time Elapsed: $($Duration.Minutes)m $($Duration.Seconds)s" -ForegroundColor White
+Write-Host "Time: $($Duration.Minutes)m $($Duration.Seconds)s" -ForegroundColor White
 
 if ($Errors.Count -gt 0)
 {
-    Write-Host "`n===============================================" -ForegroundColor DarkRed
-    Write-Host "   ! ERRORS / WARNINGS ($($Errors.Count))     " -ForegroundColor Red -BackgroundColor DarkRed
-    Write-Host "===============================================" -ForegroundColor DarkRed
-    foreach ($errorItem in $Errors)
-    {
-        Write-Host "  • $errorItem" -ForegroundColor Red
-    }
-    Write-Host "===============================================" -ForegroundColor DarkRed
-} else
-{
-    Write-Host "`n[✓] No errors detected!" -ForegroundColor Green
+    Write-Host "`n[!] ERRORS ($($Errors.Count)):" -ForegroundColor Red
+    $Errors | ForEach-Object { Write-Host "  - $_" -ForegroundColor Red }
 }
+
+Write-Host "`nWaiting 5 seconds before closing..." -ForegroundColor Cyan
+Start-Sleep 5
 
 Write-Host "`n===============================================" -ForegroundColor Yellow
-Write-Host "  Press ANY KEY to close this window..." -ForegroundColor Yellow -BackgroundColor DarkYellow
+Write-Host "  PRESS ANY KEY TO CLOSE" -ForegroundColor Yellow -BackgroundColor DarkYellow
 Write-Host "===============================================" -ForegroundColor Yellow
 
-# Multiple methods to keep window open - WILL NOT CLOSE UNTIL YOU PRESS A KEY
-try
-{
-    Write-Host "`nWaiting for key press..." -ForegroundColor Gray
-    $null = $Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown")
-} catch
-{
-    Write-Host "`nPress ENTER to continue..." -ForegroundColor Gray
-    Read-Host
-}
-
-Write-Host "`nGoodbye!" -ForegroundColor Green
-Start-Sleep -Milliseconds 500
+$null = $Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown")
