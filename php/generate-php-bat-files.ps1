@@ -2,32 +2,52 @@
 
 <#
 .SYNOPSIS
-    Dynamic PHP Version Manager for Windows.
+    Dynamic PHP Version Manager for Windows
 
 .DESCRIPTION
-    - Detect installed PHP versions
-    - Install PHP from official PHP Windows releases
-    - Download latest patch for a requested major/minor branch
-    - Install an exact PHP version when available
-    - Create phpXX.bat wrappers
-    - Create cmpXX.bat Composer wrappers
-    - Verify the actual PHP version behind every wrapper
-    - Manage User/System PATH
-    - Optionally remove downloaded ZIP files
+    Features:
 
-.EXAMPLES
+      php72  -> PHP 7.2.x
+      php80  -> PHP 8.0.x
+      php81  -> PHP 8.1.x
+      php82  -> PHP 8.2.x
+      php83  -> PHP 8.3.x
+      php84  -> PHP 8.4.x
+      php85  -> PHP 8.5.x
 
-    php-manager.ps1
+      cmp72  -> Composer using PHP 7.2.x
+      cmp85  -> Composer using PHP 8.5.x
 
-    Interactive menu will be shown.
+      php    -> Active PHP
+      cmp    -> Composer using Active PHP
 
-    Commands after installation:
+    PHP may be installed anywhere:
+      C:\wamp64\bin\php\php8.2.29
+      D:\PHP\8.2
+      C:\tools\php85
+      etc.
 
-        php84 -v
-        php85 -v
+    The manager stores the exact php.exe path in registry.json.
 
-        cmp84 install
-        cmp85 update
+    Supports:
+      - Detect existing PHP installations
+      - WAMP
+      - XAMPP
+      - C:\PHP
+      - Custom paths
+      - Install PHP 7.2+ from official Windows releases
+      - Current releases
+      - Archived releases
+      - Exact versions
+      - Branch versions
+      - x64 / x86
+      - NTS / TS
+      - Composer wrappers
+      - Active PHP switching
+      - phpXX wrappers
+      - cmpXX wrappers
+      - PATH management
+      - ZIP cleanup
 #>
 
 Set-StrictMode -Version Latest
@@ -37,18 +57,18 @@ $ErrorActionPreference = "Stop"
 # CONFIGURATION
 # ============================================================
 
-$ManagerRoot = Join-Path $env:USERPROFILE ".php-manager"
-$RegistryFile = Join-Path $ManagerRoot "registry.json"
-$DownloadDir = Join-Path $ManagerRoot "downloads"
-$DefaultInstallRoot = Join-Path $ManagerRoot "versions"
+$ManagerRoot       = Join-Path $env:USERPROFILE ".php-manager"
+$RegistryFile      = Join-Path $ManagerRoot "registry.json"
+$DownloadDir       = Join-Path $ManagerRoot "downloads"
+$VersionRoot       = Join-Path $ManagerRoot "versions"
+$WrapperRoot       = Join-Path $ManagerRoot "bin"
+$ActiveFile        = Join-Path $ManagerRoot "active.json"
 
-$WrapperRoot = Join-Path $ManagerRoot "bin"
-
-# Official PHP Windows release directory
-$OfficialReleaseUrl = "https://www.php.net/~windows/releases/"
+$ReleaseUrl        = "https://windows.php.net/downloads/releases/"
+$ArchiveUrl        = "https://windows.php.net/downloads/releases/archives/"
 
 # ============================================================
-# COLORS / UI
+# UI
 # ============================================================
 
 function Write-Title {
@@ -89,26 +109,50 @@ function Initialize-Manager {
     $directories = @(
         $ManagerRoot,
         $DownloadDir,
-        $DefaultInstallRoot,
+        $VersionRoot,
         $WrapperRoot
     )
 
     foreach ($dir in $directories) {
+
         if (-not (Test-Path $dir)) {
-            New-Item -ItemType Directory -Path $dir -Force | Out-Null
+
+            New-Item `
+                -ItemType Directory `
+                -Path $dir `
+                -Force |
+                Out-Null
         }
     }
 
     if (-not (Test-Path $RegistryFile)) {
-        @{
+
+        $registry = @{
             installations = @()
-        } | ConvertTo-Json -Depth 10 |
-            Set-Content -Path $RegistryFile -Encoding UTF8
+        }
+
+        $registry |
+            ConvertTo-Json -Depth 20 |
+            Set-Content `
+                -Path $RegistryFile `
+                -Encoding UTF8
+    }
+
+    if (-not (Test-Path $ActiveFile)) {
+
+        @{
+            activePath    = $null
+            activeVersion = $null
+        } |
+            ConvertTo-Json -Depth 10 |
+            Set-Content `
+                -Path $ActiveFile `
+                -Encoding UTF8
     }
 }
 
 # ============================================================
-# JSON REGISTRY
+# REGISTRY
 # ============================================================
 
 function Get-Registry {
@@ -118,33 +162,44 @@ function Get-Registry {
     }
 
     try {
-        $content = Get-Content $RegistryFile -Raw
 
-        if ([string]::IsNullOrWhiteSpace($content)) {
-            return @{
+        $raw = Get-Content `
+            -Path $RegistryFile `
+            -Raw
+
+        if ([string]::IsNullOrWhiteSpace($raw)) {
+
+            return [PSCustomObject]@{
                 installations = @()
             }
         }
 
-        $data = $content | ConvertFrom-Json
+        $data = $raw | ConvertFrom-Json
 
         if ($null -eq $data.installations) {
-            $data | Add-Member -MemberType NoteProperty `
-                -Name installations `
-                -Value @()
+
+            $data |
+                Add-Member `
+                    -MemberType NoteProperty `
+                    -Name installations `
+                    -Value @()
         }
 
         return $data
     }
     catch {
-        Write-Warn "Registry could not be read. Recreating it."
+
+        Write-Warn "Registry is invalid. Recreating."
 
         @{
             installations = @()
-        } | ConvertTo-Json -Depth 10 |
-            Set-Content $RegistryFile -Encoding UTF8
+        } |
+            ConvertTo-Json -Depth 20 |
+            Set-Content `
+                -Path $RegistryFile `
+                -Encoding UTF8
 
-        return @{
+        return [PSCustomObject]@{
             installations = @()
         }
     }
@@ -153,23 +208,118 @@ function Get-Registry {
 function Save-Registry {
     param($Registry)
 
-    $Registry | ConvertTo-Json -Depth 10 |
-        Set-Content -Path $RegistryFile -Encoding UTF8
+    $Registry |
+        ConvertTo-Json -Depth 20 |
+        Set-Content `
+            -Path $RegistryFile `
+            -Encoding UTF8
+}
+
+# ============================================================
+# ACTIVE PHP
+# ============================================================
+
+function Get-Active {
+
+    if (-not (Test-Path $ActiveFile)) {
+
+        return [PSCustomObject]@{
+            activePath    = $null
+            activeVersion = $null
+        }
+    }
+
+    try {
+
+        $raw = Get-Content `
+            -Path $ActiveFile `
+            -Raw
+
+        if ([string]::IsNullOrWhiteSpace($raw)) {
+
+            return [PSCustomObject]@{
+                activePath    = $null
+                activeVersion = $null
+            }
+        }
+
+        return $raw | ConvertFrom-Json
+    }
+    catch {
+
+        return [PSCustomObject]@{
+            activePath    = $null
+            activeVersion = $null
+        }
+    }
+}
+
+function Set-Active {
+    param(
+        [string]$PhpPath,
+        [string]$Version
+    )
+
+    @{
+        activePath    = $PhpPath
+        activeVersion = $Version
+        updatedAt     = (Get-Date).ToString("o")
+    } |
+        ConvertTo-Json -Depth 10 |
+        Set-Content `
+            -Path $ActiveFile `
+            -Encoding UTF8
+
+    Write-OK "Active PHP: $Version"
 }
 
 # ============================================================
 # VERSION HELPERS
 # ============================================================
 
-function ConvertTo-VersionObject {
+function Get-ShortVersion {
     param([string]$Version)
 
+    if ($Version -match "^(\d+)\.(\d+)") {
+
+        return "$($Matches[1])$($Matches[2])"
+    }
+
+    return $null
+}
+
+function Test-VersionMatch {
+    param(
+        [string]$Actual,
+        [string]$Requested
+    )
+
     try {
-        return [version]$Version
+
+        $actualVersion = [version]$Actual
+
+        if ($Requested -match "^\d+\.\d+$") {
+
+            $p = $Requested.Split(".")
+
+            return (
+                $actualVersion.Major -eq [int]$p[0] -and
+                $actualVersion.Minor -eq [int]$p[1]
+            )
+        }
+
+        if ($Requested -match "^\d+\.\d+\.\d+$") {
+
+            return (
+                $actualVersion -eq [version]$Requested
+            )
+        }
     }
     catch {
-        return $null
+        return $false
     }
+
+    return $false
 }
 
 function Get-PhpVersionFromExecutable {
@@ -180,10 +330,12 @@ function Get-PhpVersionFromExecutable {
     }
 
     try {
-        $output = & $PhpExe -r 'echo PHP_VERSION;' 2>$null
+
+        $output = & $PhpExe -r "echo PHP_VERSION;" 2>$null
 
         if ($LASTEXITCODE -eq 0 -and $output) {
-            return [string]$output
+
+            return ([string]$output).Trim()
         }
     }
     catch {
@@ -193,50 +345,8 @@ function Get-PhpVersionFromExecutable {
     return $null
 }
 
-function Get-ShortVersion {
-    param([string]$Version)
-
-    $v = $Version -split "\."
-
-    if ($v.Count -lt 2) {
-        return $null
-    }
-
-    return "$($v[0])$($v[1])"
-}
-
-function Test-VersionMatch {
-    param(
-        [string]$Actual,
-        [string]$Requested
-    )
-
-    try {
-        $actualVersion = [version]$Actual
-
-        if ($Requested -match "^\d+\.\d+$") {
-
-            $parts = $Requested.Split(".")
-
-            return (
-                $actualVersion.Major -eq [int]$parts[0] -and
-                $actualVersion.Minor -eq [int]$parts[1]
-            )
-        }
-
-        if ($Requested -match "^\d+\.\d+\.\d+$") {
-            return $actualVersion -eq [version]$Requested
-        }
-    }
-    catch {
-        return $false
-    }
-
-    return $false
-}
-
 # ============================================================
-# INSTALLED PHP DISCOVERY
+# PHP DISCOVERY
 # ============================================================
 
 function Find-PhpExecutables {
@@ -251,76 +361,181 @@ function Find-PhpExecutables {
             continue
         }
 
-        $phpExe = $item.path
+        $path = [string]$item.path
 
-        if (Test-Path $phpExe) {
+        if (-not (Test-Path $path)) {
+            continue
+        }
 
-            $actual = Get-PhpVersionFromExecutable $phpExe
+        $actual = Get-PhpVersionFromExecutable $path
 
-            if ($actual) {
+        if ($actual) {
 
-                $results.Add([PSCustomObject]@{
-                    Version = $actual
-                    Path    = $phpExe
-                    Source  = "Registry"
-                })
+            $exists = $results |
+                Where-Object {
+                    $_.Path -ieq $path
+                }
+
+            if (-not $exists) {
+
+                $results.Add(
+                    [PSCustomObject]@{
+                        Version = $actual
+                        Path    = $path
+                        Source  = "Registry"
+                    }
+                )
             }
         }
     }
 
-    # Also scan common locations
+    # --------------------------------------------------------
+    # Common PHP locations
+    # --------------------------------------------------------
+
     $commonRoots = @(
         "C:\PHP",
         "C:\php",
         "C:\wamp64\bin\php",
+        "C:\wamp\bin\php",
         "C:\xampp\php",
-        $DefaultInstallRoot
+        "C:\tools\php",
+        $VersionRoot
+    )
+
+    # --------------------------------------------------------
+    # Also scan PATH directories
+    # --------------------------------------------------------
+
+    $pathEntries = @()
+
+    foreach ($scope in @("User", "Machine")) {
+
+        try {
+
+            $p = [Environment]::GetEnvironmentVariable(
+                "Path",
+                $scope
+            )
+
+            if ($p) {
+
+                $pathEntries += (
+                    $p -split ";" |
+                    Where-Object {
+                        -not [string]::IsNullOrWhiteSpace($_)
+                    }
+                )
+            }
+        }
+        catch {}
+    }
+
+    $commonRoots += $pathEntries
+
+    $commonRoots = @(
+        $commonRoots |
+        Where-Object {
+            $_ -and (Test-Path $_)
+        } |
+        Sort-Object -Unique
     )
 
     foreach ($root in $commonRoots) {
 
-        if (-not (Test-Path $root)) {
-            continue
-        }
+        try {
 
-        $files = Get-ChildItem `
-            -Path $root `
-            -Filter "php.exe" `
-            -File `
-            -Recurse `
-            -ErrorAction SilentlyContinue
+            $files = Get-ChildItem `
+                -Path $root `
+                -Filter "php.exe" `
+                -File `
+                -Recurse `
+                -ErrorAction SilentlyContinue
 
-        foreach ($file in $files) {
+            foreach ($file in $files) {
 
-            $actual = Get-PhpVersionFromExecutable $file.FullName
+                $actual = Get-PhpVersionFromExecutable `
+                    $file.FullName
 
-            if ($actual) {
-
-                $alreadyExists = $results | Where-Object {
-                    $_.Path -eq $file.FullName
+                if (-not $actual) {
+                    continue
                 }
 
-                if (-not $alreadyExists) {
+                $exists = $results |
+                    Where-Object {
+                        $_.Path -ieq $file.FullName
+                    }
 
-                    $results.Add([PSCustomObject]@{
-                        Version = $actual
-                        Path    = $file.FullName
-                        Source  = "Scan"
-                    })
+                if (-not $exists) {
+
+                    $results.Add(
+                        [PSCustomObject]@{
+                            Version = $actual
+                            Path    = $file.FullName
+                            Source  = "Scan"
+                        }
+                    )
                 }
             }
         }
+        catch {}
     }
 
-    return $results |
-        Sort-Object @{Expression = {
-            try { [version]$_.Version }
-            catch { [version]"0.0.0" }
-        }} -Descending
+    return @(
+        $results |
+        Sort-Object `
+            @{Expression = {
+                try {
+                    [version]$_.Version
+                }
+                catch {
+                    [version]"0.0.0"
+                }
+            }} `
+            -Descending
+    )
 }
 
 # ============================================================
-# DISPLAY INSTALLED VERSIONS
+# REGISTER PHP
+# ============================================================
+
+function Register-Php {
+    param(
+        [string]$PhpPath,
+        [string]$Version,
+        [string]$Architecture,
+        [string]$ThreadSafety,
+        [string]$InstallPath
+    )
+
+    $registry = Get-Registry
+
+    $entries = @(
+        $registry.installations |
+        Where-Object {
+            $_.path -ine $PhpPath
+        }
+    )
+
+    $entry = [PSCustomObject]@{
+        version      = $Version
+        path         = $PhpPath
+        installPath  = $InstallPath
+        architecture = $Architecture
+        threadSafety = $ThreadSafety
+        registeredAt = (Get-Date).ToString("o")
+    }
+
+    $registry.installations = @(
+        $entries + $entry
+    )
+
+    Save-Registry $registry
+}
+
+# ============================================================
+# SHOW INSTALLED
 # ============================================================
 
 function Show-InstalledVersions {
@@ -328,52 +543,121 @@ function Show-InstalledVersions {
     Write-Title "Installed PHP Versions"
 
     $versions = @(Find-PhpExecutables)
+    $active = Get-Active
 
     if ($versions.Count -eq 0) {
 
-        Write-Warn "No PHP installations were found."
+        Write-Warn "No PHP installations found."
         return
     }
 
-    $i = 1
-
     foreach ($php in $versions) {
 
+        $isActive = (
+            $active.activePath -and
+            ($php.Path -ieq $active.activePath)
+        )
+
         Write-Host ""
-        Write-Host "[$i] PHP $($php.Version)" -ForegroundColor Green
-        Write-Host "    $($php.Path)" -ForegroundColor Gray
+
+        if ($isActive) {
+
+            Write-Host "[ACTIVE] PHP $($php.Version)" `
+                -ForegroundColor Green
+        }
+        else {
+
+            Write-Host "PHP $($php.Version)" `
+                -ForegroundColor Cyan
+        }
+
+        Write-Host "  Path   : $($php.Path)" `
+            -ForegroundColor Gray
+
+        Write-Host "  Source : $($php.Source)" `
+            -ForegroundColor Gray
 
         $short = Get-ShortVersion $php.Version
 
         if ($short) {
-            Write-Host "    Command: php$short" -ForegroundColor Cyan
-        }
 
-        $i++
+            Write-Host "  Command: php$short" `
+                -ForegroundColor Yellow
+        }
     }
 
     Write-Host ""
 }
 
 # ============================================================
-# OFFICIAL RELEASE DATA
+# OFFICIAL WINDOWS PHP RELEASES
 # ============================================================
 
-function Get-OfficialReleaseData {
+function Get-WebText {
+    param([string]$Url)
 
-    Write-Info "Fetching official PHP Windows release list..."
+    Write-Info "Fetching: $Url"
 
     try {
+
+        $ProgressPreference = "SilentlyContinue"
+
         $response = Invoke-WebRequest `
-            -Uri $OfficialReleaseUrl `
+            -Uri $Url `
             -UseBasicParsing `
-            -TimeoutSec 30
+            -TimeoutSec 60
+
+        $ProgressPreference = "Continue"
 
         return $response.Content
     }
     catch {
-        throw "Unable to contact official PHP release server: $($_.Exception.Message)"
+
+        throw "Unable to fetch $Url : $($_.Exception.Message)"
     }
+}
+
+function Get-ReleaseFiles {
+    param(
+        [string]$Html
+    )
+
+    $pattern = 'php-\d+\.\d+\.\d+-(?:nts-)?Win32-[^"\s<>]+-(?:x64|x86)\.zip'
+
+    $matches = [regex]::Matches(
+        $Html,
+        $pattern,
+        [System.Text.RegularExpressions.RegexOptions]::IgnoreCase
+    )
+
+    return @(
+        $matches |
+        ForEach-Object {
+            $_.Value
+        } |
+        Sort-Object -Unique
+    )
+}
+
+function Parse-PhpZipFile {
+    param([string]$FileName)
+
+    if ($FileName -match '^php-(\d+\.\d+\.\d+)-(nts-)?Win32-.*-(x64|x86)\.zip$') {
+
+        return [PSCustomObject]@{
+            FileName    = $FileName
+            Version     = $Matches[1]
+            ThreadSafety = if ($Matches[2]) {
+                "nts"
+            }
+            else {
+                "ts"
+            }
+            Architecture = $Matches[3]
+        }
+    }
+
+    return $null
 }
 
 function Find-PhpRelease {
@@ -389,60 +673,135 @@ function Find-PhpRelease {
         [string]$Architecture = "x64"
     )
 
-    $html = Get-OfficialReleaseData
+    Write-Info "Searching official PHP Windows releases..."
 
-    # --------------------------------------------------------
-    # Exact version requested:
-    #
-    # 8.4.25
-    #
-    # or branch:
-    #
-    # 8.4
-    # --------------------------------------------------------
+    $releaseHtml = $null
+    $archiveHtml = $null
 
-    $escaped = [regex]::Escape($RequestedVersion)
-
-    $pattern = "php-$escaped(?:-nts)?-Win32-vs\d+-${Architecture}\.zip"
-
-    $matches = [regex]::Matches(
-        $html,
-        $pattern,
-        [System.Text.RegularExpressions.RegexOptions]::IgnoreCase
-    )
-
-    if ($matches.Count -eq 0) {
-
-        throw "No official Windows PHP build found for $RequestedVersion ($Architecture/$ThreadSafety)."
+    try {
+        $releaseHtml = Get-WebText $ReleaseUrl
+    }
+    catch {
+        Write-Warn "Current release list unavailable."
     }
 
-    $files = @(
-        $matches |
-        ForEach-Object { $_.Value } |
+    try {
+        $archiveHtml = Get-WebText $ArchiveUrl
+    }
+    catch {
+        Write-Warn "Archive release list unavailable."
+    }
+
+    $allFiles = @()
+
+    if ($releaseHtml) {
+
+        $allFiles += Get-ReleaseFiles `
+            -Html $releaseHtml
+    }
+
+    if ($archiveHtml) {
+
+        $allFiles += Get-ReleaseFiles `
+            -Html $archiveHtml
+    }
+
+    $allFiles = @(
+        $allFiles |
         Sort-Object -Unique
     )
 
-    # Prefer NTS or TS according to selection
-    if ($ThreadSafety -eq "nts") {
+    $parsed = @()
 
-        $selected = $files |
-            Where-Object { $_ -match "-nts-" } |
-            Select-Object -First 1
+    foreach ($file in $allFiles) {
+
+        $info = Parse-PhpZipFile $file
+
+        if ($null -eq $info) {
+            continue
+        }
+
+        if ($info.Architecture -ne $Architecture) {
+            continue
+        }
+
+        if ($info.ThreadSafety -ne $ThreadSafety) {
+            continue
+        }
+
+        $parsed += $info
+    }
+
+    if ($RequestedVersion -match "^\d+\.\d+$") {
+
+        $parsed = @(
+            $parsed |
+            Where-Object {
+                $_.Version -like "$RequestedVersion.*"
+            }
+        )
     }
     else {
 
-        $selected = $files |
-            Where-Object { $_ -notmatch "-nts-" } |
-            Select-Object -First 1
+        $parsed = @(
+            $parsed |
+            Where-Object {
+                $_.Version -eq $RequestedVersion
+            }
+        )
     }
 
-    if (-not $selected) {
-        throw "Requested Thread Safety build was not found."
+    if ($parsed.Count -eq 0) {
+
+        throw @"
+No official Windows PHP build found.
+
+Requested:
+  Version     : $RequestedVersion
+  Architecture: $Architecture
+  ThreadSafety: $ThreadSafety
+
+The requested combination may not exist officially.
+Try:
+  - x64 instead of x86
+  - NTS instead of TS
+  - another patch version
+"@
+    }
+
+    $selected = $parsed |
+        Sort-Object {
+            try {
+                [version]$_.Version
+            }
+            catch {
+                [version]"0.0.0"
+            }
+        } -Descending |
+        Select-Object -First 1
+
+    $source = "Current"
+
+    if ($archiveHtml -and
+        ($archiveHtml -match [regex]::Escape($selected.FileName))) {
+
+        $source = "Archive"
+    }
+
+    $baseUrl = if ($source -eq "Archive") {
+        $ArchiveUrl
+    }
+    else {
+        $ReleaseUrl
     }
 
     return [PSCustomObject]@{
-        FileName = $selected
-        Url      = "$OfficialReleaseUrl$selected"
+        FileName      = $selected.FileName
+        Version       = $selected.Version
+        ThreadSafety  = $selected.ThreadSafety
+        Architecture  = $selected.Architecture
+        Source        = $source
+        Url           = "$baseUrl$($selected.FileName)"
     }
 }
 
@@ -451,7 +810,6 @@ function Find-PhpRelease {
 # ============================================================
 
 function Download-File {
-
     param(
         [string]$Url,
         [string]$Destination
@@ -468,12 +826,21 @@ function Download-File {
         Invoke-WebRequest `
             -Uri $Url `
             -OutFile $Destination `
-            -UseBasicParsing
+            -UseBasicParsing `
+            -TimeoutSec 600
 
         $ProgressPreference = "Continue"
 
         if (-not (Test-Path $Destination)) {
-            throw "Download completed but file was not found."
+
+            throw "Downloaded file was not found."
+        }
+
+        $size = (Get-Item $Destination).Length
+
+        if ($size -lt 10000) {
+
+            throw "Downloaded file looks invalid or incomplete."
         }
 
         Write-OK "Download completed."
@@ -485,311 +852,16 @@ function Download-File {
 }
 
 # ============================================================
-# INSTALL PHP
+# WRAPPER CONTENT
 # ============================================================
 
-function Install-Php {
+function Escape-BatchValue {
+    param([string]$Value)
 
-    Write-Title "Install PHP"
-
-    $requested = Read-Host `
-        "Enter PHP version (example: 8.4 or exact 8.4.25)"
-
-    if ([string]::IsNullOrWhiteSpace($requested)) {
-        Write-Err "Version is required."
-        return
-    }
-
-    if ($requested -notmatch "^\d+\.\d+(?:\.\d+)?$") {
-        Write-Err "Invalid version format."
-        Write-Info "Examples: 8.4   OR   8.4.25"
-        return
-    }
-
-    # Architecture
-    $architecture = Read-Host `
-        "Architecture [x64/x86] (default: x64)"
-
-    if ([string]::IsNullOrWhiteSpace($architecture)) {
-        $architecture = "x64"
-    }
-
-    $architecture = $architecture.ToLower()
-
-    if ($architecture -notin @("x64", "x86")) {
-        Write-Err "Architecture must be x64 or x86."
-        return
-    }
-
-    # Thread safety
-    Write-Host ""
-    Write-Host "Thread Safety:" -ForegroundColor Cyan
-    Write-Host "  1. NTS - CLI / FastCGI (recommended for normal CLI use)"
-    Write-Host "  2. TS  - Apache module / threaded SAPIs"
-
-    $tsChoice = Read-Host "Choose [1/2] (default: 1)"
-
-    if ([string]::IsNullOrWhiteSpace($tsChoice)) {
-        $tsChoice = "1"
-    }
-
-    if ($tsChoice -eq "2") {
-        $threadSafety = "ts"
-    }
-    else {
-        $threadSafety = "nts"
-    }
-
-    # Installation path
-    Write-Host ""
-
-    $defaultPath = Join-Path $DefaultInstallRoot $requested
-
-    $installPath = Read-Host `
-        "Installation folder (default: $defaultPath)"
-
-    if ([string]::IsNullOrWhiteSpace($installPath)) {
-        $installPath = $defaultPath
-    }
-
-    $installPath = [Environment]::ExpandEnvironmentVariables($installPath)
-
-    if (Test-Path $installPath) {
-
-        $existingPhp = Join-Path $installPath "php.exe"
-
-        if (Test-Path $existingPhp) {
-
-            $existingVersion = Get-PhpVersionFromExecutable $existingPhp
-
-            if ($existingVersion) {
-
-                Write-Warn "PHP $existingVersion already exists here."
-
-                $continue = Read-Host "Continue and overwrite/reinstall? [y/N]"
-
-                if ($continue -notmatch "^[Yy]$") {
-                    return
-                }
-            }
-        }
-    }
-
-    # Find official release
-    try {
-
-        Write-Info "Looking for official PHP release..."
-
-        $release = Find-PhpRelease `
-            -RequestedVersion $requested `
-            -ThreadSafety $threadSafety `
-            -Architecture $architecture
-
-        Write-OK "Found: $($release.FileName)"
-        Write-Host ""
-    }
-    catch {
-
-        Write-Err $_.Exception.Message
-        return
-    }
-
-    # ZIP path
-    $zipPath = Join-Path $DownloadDir $release.FileName
-
-    # Download
-    if (Test-Path $zipPath) {
-
-        Write-Warn "ZIP already exists:"
-        Write-Host $zipPath
-
-        $useExisting = Read-Host "Use existing ZIP? [Y/n]"
-
-        if ($useExisting -match "^[Nn]$") {
-            Remove-Item $zipPath -Force
-            Download-File $release.Url $zipPath
-        }
-    }
-    else {
-        Download-File $release.Url $zipPath
-    }
-
-    # Create temporary extraction directory
-    $tempPath = Join-Path $ManagerRoot `
-        ("temp-" + [guid]::NewGuid().ToString())
-
-    try {
-
-        New-Item -ItemType Directory `
-            -Path $tempPath `
-            -Force | Out-Null
-
-        Write-Info "Extracting PHP..."
-
-        Expand-Archive `
-            -Path $zipPath `
-            -DestinationPath $tempPath `
-            -Force
-
-        # Validate extracted PHP
-        $tempPhp = Get-ChildItem `
-            -Path $tempPath `
-            -Filter "php.exe" `
-            -File `
-            -Recurse `
-            -ErrorAction Stop |
-            Select-Object -First 1
-
-        if (-not $tempPhp) {
-            throw "php.exe was not found after extraction."
-        }
-
-        $actualVersion = Get-PhpVersionFromExecutable `
-            $tempPhp.FullName
-
-        if (-not $actualVersion) {
-            throw "Unable to execute extracted PHP."
-        }
-
-        Write-OK "Extracted PHP version: $actualVersion"
-
-        if (-not (Test-VersionMatch `
-                -Actual $actualVersion `
-                -Requested $requested)) {
-
-            throw @"
-Version verification failed.
-
-Requested : $requested
-Downloaded: $actualVersion
-"@
-        }
-
-        Write-OK "Version verification passed."
-
-        # Create installation directory
-        if (Test-Path $installPath) {
-
-            Remove-Item `
-                -Path $installPath `
-                -Recurse `
-                -Force
-        }
-
-        New-Item `
-            -ItemType Directory `
-            -Path $installPath `
-            -Force | Out-Null
-
-        Write-Info "Installing to:"
-        Write-Host $installPath -ForegroundColor Gray
-
-        # Move files
-        Copy-Item `
-            -Path (Join-Path $tempPhp.Directory.FullName "*") `
-            -Destination $installPath `
-            -Recurse `
-            -Force
-
-        $finalPhp = Join-Path $installPath "php.exe"
-
-        if (-not (Test-Path $finalPhp)) {
-            throw "Installation failed: php.exe missing."
-        }
-
-        $finalVersion = Get-PhpVersionFromExecutable $finalPhp
-
-        if (-not $finalVersion) {
-            throw "Installed PHP could not be executed."
-        }
-
-        Write-OK "Installed PHP $finalVersion"
-
-        # Registry entry
-        $registry = Get-Registry
-
-        $newEntry = [PSCustomObject]@{
-            version      = $finalVersion
-            requested    = $requested
-            path         = $finalPhp
-            installPath  = $installPath
-            architecture = $architecture
-            threadSafety = $threadSafety
-            installedAt  = (Get-Date).ToString("o")
-        }
-
-        $existing = @(
-            $registry.installations |
-            Where-Object {
-                $_.path -ne $finalPhp
-            }
-        )
-
-        $registry.installations = @(
-            $existing + $newEntry
-        )
-
-        Save-Registry $registry
-
-        # Create wrapper
-        New-PhpWrapper `
-            -PhpPath $finalPhp `
-            -Version $finalVersion
-
-        Write-OK "php$(Get-ShortVersion $finalVersion) command created."
-
-        # Composer
-        New-ComposerWrapper `
-            -PhpPath $finalPhp `
-            -Version $finalVersion
-
-        # Delete ZIP?
-        Write-Host ""
-
-        $deleteZip = Read-Host `
-            "Delete downloaded ZIP file? [Y/n]"
-
-        if ($deleteZip -notmatch "^[Nn]$") {
-
-            Remove-Item $zipPath -Force
-
-            Write-OK "ZIP removed."
-        }
-        else {
-            Write-Info "ZIP kept at:"
-            Write-Host $zipPath
-        }
-
-        Write-Host ""
-        Write-OK "PHP $finalVersion installation completed."
-
-        Write-Host ""
-        Write-Host "Command:" -ForegroundColor Cyan
-        Write-Host "  php$(Get-ShortVersion $finalVersion) -v"
-
-    }
-    catch {
-
-        Write-Err $_.Exception.Message
-    }
-    finally {
-
-        if (Test-Path $tempPath) {
-            Remove-Item `
-                $tempPath `
-                -Recurse `
-                -Force `
-                -ErrorAction SilentlyContinue
-        }
-    }
+    return $Value.Replace("%", "%%")
 }
 
-# ============================================================
-# PHP WRAPPER
-# ============================================================
-
 function New-PhpWrapper {
-
     param(
         [string]$PhpPath,
         [string]$Version
@@ -798,22 +870,106 @@ function New-PhpWrapper {
     $short = Get-ShortVersion $Version
 
     if (-not $short) {
-        return
+        throw "Could not generate short version for $Version"
     }
 
     $wrapper = Join-Path `
         $WrapperRoot `
         "php$short.bat"
 
+    $safePath = Escape-BatchValue $PhpPath
+
     $content = @"
 @echo off
-set "PHP_MANAGER_EXE=$PhpPath"
-if not exist "%PHP_MANAGER_EXE%" (
-    echo ERROR: PHP executable not found:
-    echo %PHP_MANAGER_EXE%
+setlocal
+
+set "PHP_EXE=$safePath"
+
+if not exist "%PHP_EXE%" (
+    echo.
+    echo ERROR: PHP $Version is no longer available.
+    echo.
+    echo Expected:
+    echo %PHP_EXE%
+    echo.
+    echo Run PHP Manager and rebuild wrappers.
     exit /b 1
 )
-"%PHP_MANAGER_EXE%" %*
+
+"%PHP_EXE%" %*
+
+endlocal
+"@
+
+    # Detect conflicting wrapper
+    if (Test-Path $wrapper) {
+
+        $old = Get-Content `
+            -Path $wrapper `
+            -Raw `
+            -ErrorAction SilentlyContinue
+
+        if ($old -and
+            ($old -notmatch [regex]::Escape($PhpPath))) {
+
+            Write-Warn "Replacing existing conflicting wrapper:"
+            Write-Host $wrapper
+        }
+    }
+
+    Set-Content `
+        -Path $wrapper `
+        -Value $content `
+        -Encoding ASCII
+
+    Write-OK "Created php$short.bat"
+}
+
+# ============================================================
+# ACTIVE PHP WRAPPER
+# ============================================================
+
+function New-ActivePhpWrapper {
+
+    $wrapper = Join-Path `
+        $WrapperRoot `
+        "php.bat"
+
+    $activeFileForBatch = Escape-BatchValue $ActiveFile
+
+    $content = @"
+@echo off
+setlocal
+
+set "ACTIVE_FILE=$activeFileForBatch"
+
+if not exist "%ACTIVE_FILE%" (
+    echo ERROR: Active PHP configuration not found.
+    echo Run PHP Manager and select an active PHP version.
+    exit /b 1
+)
+
+for /f "usebackq tokens=2 delims=:," %%A in (`powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "$j=Get-Content -Raw -LiteralPath '%ActiveFile%'^|ConvertFrom-Json; if($j.activePath){$j.activePath}"`) do (
+    set "PHP_EXE=%%~A"
+)
+
+if not defined PHP_EXE (
+    echo ERROR: No active PHP selected.
+    echo.
+    echo Use PHP Manager and select:
+    echo   Switch active PHP
+    exit /b 1
+)
+
+if not exist "%PHP_EXE%" (
+    echo ERROR: Active PHP executable not found:
+    echo %PHP_EXE%
+    exit /b 1
+)
+
+"%PHP_EXE%" %*
+
+endlocal
 "@
 
     Set-Content `
@@ -821,7 +977,7 @@ if not exist "%PHP_MANAGER_EXE%" (
         -Value $content `
         -Encoding ASCII
 
-    Write-OK "Created $wrapper"
+    Write-OK "Created active php command"
 }
 
 # ============================================================
@@ -832,21 +988,64 @@ function Find-Composer {
 
     $candidates = @(
         "C:\ProgramData\ComposerSetup\bin\composer.phar",
-        "C:\ProgramData\ComposerSetup\bin\composer.bat",
-        (Join-Path $env:APPDATA "Composer\composer.phar")
+        (Join-Path $env:APPDATA "Composer\composer.phar"),
+        (Join-Path $env:LOCALAPPDATA "Composer\composer.phar")
     )
 
     foreach ($candidate in $candidates) {
 
         if (Test-Path $candidate) {
-            return $candidate
+
+            return [PSCustomObject]@{
+                Type = "phar"
+                Path = $candidate
+            }
         }
     }
 
-    $command = Get-Command composer -ErrorAction SilentlyContinue
+    $command = Get-Command `
+        composer `
+        -ErrorAction SilentlyContinue
 
     if ($command) {
-        return $command.Source
+
+        $source = $command.Source
+
+        if ($source -match "\.bat$") {
+
+            # Try to find Composer PHAR referenced by composer.bat
+            try {
+
+                $bat = Get-Content `
+                    -Path $source `
+                    -Raw
+
+                $pharMatch = [regex]::Match(
+                    $bat,
+                    '"([^"]*composer\.phar)"',
+                    [System.Text.RegularExpressions.RegexOptions]::IgnoreCase
+                )
+
+                if ($pharMatch.Success) {
+
+                    $phar = $pharMatch.Groups[1].Value
+
+                    if (Test-Path $phar) {
+
+                        return [PSCustomObject]@{
+                            Type = "phar"
+                            Path = $phar
+                        }
+                    }
+                }
+            }
+            catch {}
+        }
+
+        return [PSCustomObject]@{
+            Type = "command"
+            Path = $source
+        }
     }
 
     return $null
@@ -857,7 +1056,6 @@ function Find-Composer {
 # ============================================================
 
 function New-ComposerWrapper {
-
     param(
         [string]$PhpPath,
         [string]$Version
@@ -867,30 +1065,32 @@ function New-ComposerWrapper {
 
     if (-not $composer) {
 
-        Write-Warn "Composer was not found. cmp wrapper not created."
+        Write-Warn "Composer was not found."
+        Write-Warn "cmp$((Get-ShortVersion $Version)) was not created."
         return
     }
 
     $short = Get-ShortVersion $Version
 
-    if (-not $short) {
-        return
-    }
-
     $wrapper = Join-Path `
         $WrapperRoot `
         "cmp$short.bat"
 
-    if ($composer -match "\.phar$") {
+    $safePhp = Escape-BatchValue $PhpPath
+    $safeComposer = Escape-BatchValue $composer.Path
+
+    if ($composer.Type -eq "phar") {
 
         $content = @"
 @echo off
-set "PHP_MANAGER_EXE=$PhpPath"
-set "COMPOSER_PHAR=$composer"
+setlocal
 
-if not exist "%PHP_MANAGER_EXE%" (
-    echo ERROR: PHP executable not found:
-    echo %PHP_MANAGER_EXE%
+set "PHP_EXE=$safePhp"
+set "COMPOSER_PHAR=$safeComposer"
+
+if not exist "%PHP_EXE%" (
+    echo ERROR: PHP $Version not found:
+    echo %PHP_EXE%
     exit /b 1
 )
 
@@ -900,23 +1100,29 @@ if not exist "%COMPOSER_PHAR%" (
     exit /b 1
 )
 
-"%PHP_MANAGER_EXE%" "%COMPOSER_PHAR%" %*
+"%PHP_EXE%" "%COMPOSER_PHAR%" %*
+
+endlocal
 "@
     }
     else {
 
         $content = @"
 @echo off
-set "PHP_MANAGER_EXE=$PhpPath"
-set "COMPOSER_CMD=$composer"
+setlocal
 
-if not exist "%PHP_MANAGER_EXE%" (
-    echo ERROR: PHP executable not found:
-    echo %PHP_MANAGER_EXE%
+set "PHP_EXE=$safePhp"
+set "COMPOSER_CMD=$safeComposer"
+
+if not exist "%PHP_EXE%" (
+    echo ERROR: PHP $Version not found:
+    echo %PHP_EXE%
     exit /b 1
 )
 
 call "%COMPOSER_CMD%" %*
+
+endlocal
 "@
     }
 
@@ -925,190 +1131,755 @@ call "%COMPOSER_CMD%" %*
         -Value $content `
         -Encoding ASCII
 
-    Write-OK "Created cmp$short"
+    Write-OK "Created cmp$short.bat"
 }
 
 # ============================================================
-# PATH MANAGEMENT
+# ACTIVE COMPOSER WRAPPER
 # ============================================================
 
-function Get-PathEntries {
-    param(
-        [ValidateSet("User", "Machine")]
-        [string]$Scope
-    )
+function New-ActiveComposerWrapper {
 
-    $path = [Environment]::GetEnvironmentVariable(
-        "Path",
-        $Scope
-    )
+    $composer = Find-Composer
 
-    if ([string]::IsNullOrWhiteSpace($path)) {
-        return @()
-    }
+    if (-not $composer) {
 
-    return $path -split ";" |
-        Where-Object {
-            -not [string]::IsNullOrWhiteSpace($_)
-        }
-}
-
-function Add-ToPath {
-
-    param(
-        [ValidateSet("User", "Machine")]
-        [string]$Scope
-    )
-
-    $current = [Environment]::GetEnvironmentVariable(
-        "Path",
-        $Scope
-    )
-
-    $entries = @()
-
-    if ($current) {
-        $entries = @(
-            $current -split ";" |
-            Where-Object {
-                -not [string]::IsNullOrWhiteSpace($_)
-            }
-        )
-    }
-
-    $already = $entries |
-        Where-Object {
-            $_.TrimEnd("\") -ieq $WrapperRoot.TrimEnd("\")
-        }
-
-    if ($already) {
-
-        Write-Warn "$WrapperRoot is already in $Scope PATH."
+        Write-Warn "Composer not found. cmp wrapper not created."
         return
     }
 
-    $newPath = (
-        @($entries) + $WrapperRoot
-    ) -join ";"
+    $wrapper = Join-Path `
+        $WrapperRoot `
+        "cmp.bat"
+
+    $safeActive = Escape-BatchValue $ActiveFile
+    $safeComposer = Escape-BatchValue $composer.Path
+
+    if ($composer.Type -eq "phar") {
+
+        $content = @"
+@echo off
+setlocal
+
+set "ACTIVE_FILE=$safeActive"
+set "COMPOSER_PHAR=$safeComposer"
+
+if not exist "%COMPOSER_PHAR%" (
+    echo ERROR: Composer PHAR not found:
+    echo %COMPOSER_PHAR%
+    exit /b 1
+)
+
+for /f "usebackq tokens=2 delims=:," %%A in (`powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "$j=Get-Content -Raw -LiteralPath '%ActiveFile%'^|ConvertFrom-Json; if($j.activePath){$j.activePath}"`) do (
+    set "PHP_EXE=%%~A"
+)
+
+if not defined PHP_EXE (
+    echo ERROR: No active PHP selected.
+    exit /b 1
+)
+
+if not exist "%PHP_EXE%" (
+    echo ERROR: Active PHP not found:
+    echo %PHP_EXE%
+    exit /b 1
+)
+
+"%PHP_EXE%" "%COMPOSER_PHAR%" %*
+
+endlocal
+"@
+    }
+    else {
+
+        $content = @"
+@echo off
+setlocal
+
+set "COMPOSER_CMD=$safeComposer"
+set "ACTIVE_FILE=$safeActive"
+
+if not exist "%COMPOSER_CMD%" (
+    echo ERROR: Composer command not found.
+    exit /b 1
+)
+
+for /f "usebackq tokens=2 delims=:," %%A in (`powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "$j=Get-Content -Raw -LiteralPath '%ActiveFile%'^|ConvertFrom-Json; if($j.activePath){$j.activePath}"`) do (
+    set "PHP_EXE=%%~A"
+)
+
+if defined PHP_EXE (
+    set "PATH=%~dp0;%%PATH%%"
+)
+
+call "%COMPOSER_CMD%" %*
+
+endlocal
+"@
+    }
+
+    Set-Content `
+        -Path $wrapper `
+        -Value $content `
+        -Encoding ASCII
+
+    Write-OK "Created active cmp command"
+}
+
+# ============================================================
+# REBUILD WRAPPERS
+# ============================================================
+
+function Rebuild-Wrappers {
+
+    Write-Title "Rebuilding Wrappers"
+
+    $versions = @(Find-PhpExecutables)
+
+    if ($versions.Count -eq 0) {
+
+        Write-Warn "No PHP installations found."
+        return
+    }
+
+    foreach ($php in $versions) {
+
+        $actual = Get-PhpVersionFromExecutable $php.Path
+
+        if (-not $actual) {
+
+            Write-Warn "Could not verify:"
+            Write-Host $php.Path
+            continue
+        }
+
+        Register-Php `
+            -PhpPath $php.Path `
+            -Version $actual `
+            -Architecture "unknown" `
+            -ThreadSafety "unknown" `
+            -InstallPath (
+                Split-Path `
+                    $php.Path `
+                    -Parent
+            )
+
+        New-PhpWrapper `
+            -PhpPath $php.Path `
+            -Version $actual
+
+        New-ComposerWrapper `
+            -PhpPath $php.Path `
+            -Version $actual
+    }
+
+    New-ActivePhpWrapper
+    New-ActiveComposerWrapper
+
+    Write-OK "All wrappers rebuilt."
+}
+
+# ============================================================
+# INSTALL PHP
+# ============================================================
+
+function Install-Php {
+
+    Write-Title "Install PHP"
+
+    $requested = Read-Host `
+        "Enter PHP version (example: 8.4 or exact 8.4.15)"
+
+    if ([string]::IsNullOrWhiteSpace($requested)) {
+        Write-Err "PHP version is required."
+        return
+    }
+
+    if ($requested -notmatch "^\d+\.\d+(?:\.\d+)?$") {
+
+        Write-Err "Invalid version format."
+
+        Write-Host ""
+        Write-Host "Examples:"
+        Write-Host "  7.2"
+        Write-Host "  7.2.34"
+        Write-Host "  8.4"
+        Write-Host "  8.4.15"
+
+        return
+    }
+
+    # --------------------------------------------------------
+    # Architecture
+    # --------------------------------------------------------
+
+    Write-Host ""
+
+    $architecture = Read-Host `
+        "Architecture [x64/x86] (default: x64)"
+
+    if ([string]::IsNullOrWhiteSpace($architecture)) {
+        $architecture = "x64"
+    }
+
+    $architecture = $architecture.ToLower()
+
+    if ($architecture -notin @("x64", "x86")) {
+
+        Write-Err "Architecture must be x64 or x86."
+        return
+    }
+
+    # --------------------------------------------------------
+    # Thread Safety
+    # --------------------------------------------------------
+
+    Write-Host ""
+    Write-Host "Thread Safety:" -ForegroundColor Cyan
+    Write-Host "  1. NTS - CLI / FastCGI (recommended)"
+    Write-Host "  2. TS  - Apache module / threaded SAPIs"
+
+    $choice = Read-Host `
+        "Choose [1/2] (default: 1)"
+
+    if ([string]::IsNullOrWhiteSpace($choice)) {
+        $choice = "1"
+    }
+
+    if ($choice -eq "2") {
+        $threadSafety = "ts"
+    }
+    else {
+        $threadSafety = "nts"
+    }
+
+    # --------------------------------------------------------
+    # Find release FIRST
+    # --------------------------------------------------------
 
     try {
 
-        [Environment]::SetEnvironmentVariable(
-            "Path",
-            $newPath,
-            $Scope
-        )
+        Write-Host ""
 
-        Write-OK "Added $WrapperRoot to $Scope PATH."
+        $release = Find-PhpRelease `
+            -RequestedVersion $requested `
+            -ThreadSafety $threadSafety `
+            -Architecture $architecture
 
-        Write-Warn "Open a NEW terminal window for PATH changes to appear."
+        Write-Host ""
+        Write-OK "Selected PHP $($release.Version)"
+
+        Write-Host "File:"
+        Write-Host "  $($release.FileName)"
+
+        Write-Host "Source:"
+        Write-Host "  $($release.Source)"
+
+        Write-Host "URL:"
+        Write-Host "  $($release.Url)"
+
     }
     catch {
 
         Write-Err $_.Exception.Message
-
-        if ($Scope -eq "Machine") {
-            Write-Warn "Run PowerShell as Administrator for Machine PATH."
-        }
-    }
-}
-
-function Path-Menu {
-
-    Write-Title "PATH Manager"
-
-    Write-Host "1. Add to User PATH"
-    Write-Host "2. Add to Machine PATH"
-    Write-Host "3. Show User PATH status"
-    Write-Host "4. Show Machine PATH status"
-    Write-Host "5. Back"
-
-    $choice = Read-Host "Select"
-
-    switch ($choice) {
-
-        "1" {
-            Add-ToPath -Scope User
-        }
-
-        "2" {
-            Add-ToPath -Scope Machine
-        }
-
-        "3" {
-            $entries = Get-PathEntries -Scope User
-
-            if ($entries -contains $WrapperRoot) {
-                Write-OK "Wrapper directory exists in User PATH."
-            }
-            else {
-                Write-Warn "Not present in User PATH."
-            }
-        }
-
-        "4" {
-            $entries = Get-PathEntries -Scope Machine
-
-            if ($entries -contains $WrapperRoot) {
-                Write-OK "Wrapper directory exists in Machine PATH."
-            }
-            else {
-                Write-Warn "Not present in Machine PATH."
-            }
-        }
-    }
-}
-
-# ============================================================
-# VERIFY COMMANDS
-# ============================================================
-
-function Verify-VersionCommand {
-
-    Write-Title "Verify PHP Command"
-
-    $requested = Read-Host `
-        "Enter command/version (example: php84 or 8.4)"
-
-    if ([string]::IsNullOrWhiteSpace($requested)) {
         return
     }
 
-    if ($requested -match "^php(\d+)$") {
+    # --------------------------------------------------------
+    # Installation path
+    # --------------------------------------------------------
 
-        $short = $Matches[1]
-        $commandName = "php$short"
+    Write-Host ""
+
+    $defaultInstall = Join-Path `
+        $VersionRoot `
+        $release.Version
+
+    $installPath = Read-Host `
+        "Installation folder (default: $defaultInstall)"
+
+    if ([string]::IsNullOrWhiteSpace($installPath)) {
+        $installPath = $defaultInstall
     }
-    elseif ($requested -match "^\d+\.\d+$") {
 
-        $commandName = "php" + (
-            $requested -replace "\.", ""
+    $installPath = `
+        [Environment]::ExpandEnvironmentVariables(
+            $installPath
         )
+
+    # --------------------------------------------------------
+    # Confirmation
+    # --------------------------------------------------------
+
+    Write-Host ""
+
+    $confirm = Read-Host `
+        "Install PHP $($release.Version) here? [Y/n]"
+
+    if ($confirm -match "^[Nn]$") {
+
+        Write-Warn "Installation cancelled."
+        return
+    }
+
+    # --------------------------------------------------------
+    # ZIP
+    # --------------------------------------------------------
+
+    $zipPath = Join-Path `
+        $DownloadDir `
+        $release.FileName
+
+    try {
+
+        if (Test-Path $zipPath) {
+
+            Write-Warn "ZIP already exists:"
+            Write-Host $zipPath
+
+            $use = Read-Host `
+                "Use existing ZIP? [Y/n]"
+
+            if ($use -match "^[Nn]$") {
+
+                Remove-Item `
+                    -Path $zipPath `
+                    -Force
+
+                Download-File `
+                    -Url $release.Url `
+                    -Destination $zipPath
+            }
+        }
+        else {
+
+            Download-File `
+                -Url $release.Url `
+                -Destination $zipPath
+        }
+
+        # ----------------------------------------------------
+        # Temporary extraction
+        # ----------------------------------------------------
+
+        $tempPath = Join-Path `
+            $ManagerRoot `
+            ("temp-" + [guid]::NewGuid().ToString())
+
+        New-Item `
+            -ItemType Directory `
+            -Path $tempPath `
+            -Force |
+            Out-Null
+
+        try {
+
+            Write-Info "Extracting PHP..."
+
+            Expand-Archive `
+                -Path $zipPath `
+                -DestinationPath $tempPath `
+                -Force
+
+            $tempPhp = Get-ChildItem `
+                -Path $tempPath `
+                -Filter "php.exe" `
+                -File `
+                -Recurse `
+                -ErrorAction Stop |
+                Select-Object -First 1
+
+            if (-not $tempPhp) {
+
+                throw "php.exe was not found inside the downloaded ZIP."
+            }
+
+            $actualVersion = Get-PhpVersionFromExecutable `
+                $tempPhp.FullName
+
+            if (-not $actualVersion) {
+
+                throw "Extracted PHP could not be executed."
+            }
+
+            Write-OK "Extracted PHP version: $actualVersion"
+
+            # ------------------------------------------------
+            # Verify requested branch/exact version
+            # ------------------------------------------------
+
+            if (-not (
+                Test-VersionMatch `
+                    -Actual $actualVersion `
+                    -Requested $requested
+            )) {
+
+                throw @"
+PHP version verification failed.
+
+Requested:
+  $requested
+
+Downloaded:
+  $actualVersion
+"@
+            }
+
+            Write-OK "Version verification passed."
+
+            # ------------------------------------------------
+            # Existing installation
+            # ------------------------------------------------
+
+            if (Test-Path $installPath) {
+
+                $existingPhp = Join-Path `
+                    $installPath `
+                    "php.exe"
+
+                if (Test-Path $existingPhp) {
+
+                    $existingVersion = `
+                        Get-PhpVersionFromExecutable `
+                            $existingPhp
+
+                    Write-Warn `
+                        "Existing PHP found: $existingVersion"
+
+                    $overwrite = Read-Host `
+                        "Replace existing installation? [y/N]"
+
+                    if ($overwrite -notmatch "^[Yy]$") {
+
+                        Write-Warn "Installation cancelled."
+                        return
+                    }
+                }
+
+                Remove-Item `
+                    -Path $installPath `
+                    -Recurse `
+                    -Force
+            }
+
+            # ------------------------------------------------
+            # Create installation directory
+            # ------------------------------------------------
+
+            New-Item `
+                -ItemType Directory `
+                -Path $installPath `
+                -Force |
+                Out-Null
+
+            Write-Info "Installing to:"
+            Write-Host $installPath -ForegroundColor Gray
+
+            $sourceRoot = $tempPhp.Directory.FullName
+
+            Copy-Item `
+                -Path (Join-Path $sourceRoot "*") `
+                -Destination $installPath `
+                -Recurse `
+                -Force
+
+            $finalPhp = Join-Path `
+                $installPath `
+                "php.exe"
+
+            if (-not (Test-Path $finalPhp)) {
+
+                throw "Installation failed: php.exe missing."
+            }
+
+            $finalVersion = Get-PhpVersionFromExecutable `
+                $finalPhp
+
+            if (-not $finalVersion) {
+
+                throw "Installed PHP could not be executed."
+            }
+
+            Write-OK "Installed PHP $finalVersion"
+
+            # ------------------------------------------------
+            # Register exact mapping
+            # ------------------------------------------------
+
+            Register-Php `
+                -PhpPath $finalPhp `
+                -Version $finalVersion `
+                -Architecture $architecture `
+                -ThreadSafety $threadSafety `
+                -InstallPath $installPath
+
+            # ------------------------------------------------
+            # Create version wrappers
+            # ------------------------------------------------
+
+            New-PhpWrapper `
+                -PhpPath $finalPhp `
+                -Version $finalVersion
+
+            New-ComposerWrapper `
+                -PhpPath $finalPhp `
+                -Version $finalVersion
+
+            # ------------------------------------------------
+            # Active?
+            # ------------------------------------------------
+
+            Write-Host ""
+
+            $makeActive = Read-Host `
+                "Make PHP $finalVersion the active 'php' command? [Y/n]"
+
+            if ($makeActive -notmatch "^[Nn]$") {
+
+                Set-Active `
+                    -PhpPath $finalPhp `
+                    -Version $finalVersion
+
+                New-ActivePhpWrapper
+                New-ActiveComposerWrapper
+            }
+
+            # ------------------------------------------------
+            # Delete ZIP
+            # ------------------------------------------------
+
+            Write-Host ""
+
+            $deleteZip = Read-Host `
+                "Delete downloaded ZIP file? [Y/n]"
+
+            if ($deleteZip -notmatch "^[Nn]$") {
+
+                Remove-Item `
+                    -Path $zipPath `
+                    -Force
+
+                Write-OK "ZIP removed."
+            }
+            else {
+
+                Write-Info "ZIP kept:"
+                Write-Host $zipPath
+            }
+
+            Write-Host ""
+            Write-OK "PHP $finalVersion installation completed."
+
+            Write-Host ""
+            Write-Host "Commands:" -ForegroundColor Cyan
+
+            $short = Get-ShortVersion $finalVersion
+
+            Write-Host "  php$short -v"
+            Write-Host "  cmp$short --version"
+            Write-Host "  php -v"
+            Write-Host "  cmp --version"
+
+        }
+        finally {
+
+            if (Test-Path $tempPath) {
+
+                Remove-Item `
+                    -Path $tempPath `
+                    -Recurse `
+                    -Force `
+                    -ErrorAction SilentlyContinue
+            }
+        }
+    }
+    catch {
+
+        Write-Err $_.Exception.Message
+    }
+}
+
+# ============================================================
+# SWITCH ACTIVE PHP
+# ============================================================
+
+function Switch-ActivePhp {
+
+    Write-Title "Switch Active PHP"
+
+    $versions = @(Find-PhpExecutables)
+
+    if ($versions.Count -eq 0) {
+
+        Write-Warn "No PHP installations found."
+        return
+    }
+
+    for ($i = 0; $i -lt $versions.Count; $i++) {
+
+        $php = $versions[$i]
+
+        Write-Host ""
+        Write-Host "[$($i + 1)] PHP $($php.Version)" `
+            -ForegroundColor Cyan
+
+        Write-Host "    $($php.Path)" `
+            -ForegroundColor Gray
+    }
+
+    Write-Host ""
+
+    $selection = Read-Host `
+        "Select PHP number"
+
+    if ($selection -notmatch "^\d+$") {
+        Write-Err "Invalid selection."
+        return
+    }
+
+    $index = [int]$selection - 1
+
+    if (
+        $index -lt 0 -or
+        $index -ge $versions.Count
+    ) {
+
+        Write-Err "Invalid selection."
+        return
+    }
+
+    $selected = $versions[$index]
+
+    Set-Active `
+        -PhpPath $selected.Path `
+        -Version $selected.Version
+
+    New-ActivePhpWrapper
+    New-ActiveComposerWrapper
+
+    Write-Host ""
+    Write-OK "php now points to PHP $($selected.Version)"
+    Write-OK "cmp now uses PHP $($selected.Version)"
+
+    Write-Host ""
+    Write-Host "Run:"
+    Write-Host "  php -v"
+    Write-Host "  cmp --version"
+}
+
+# ============================================================
+# SHOW ACTIVE PHP
+# ============================================================
+
+function Show-ActivePhp {
+
+    Write-Title "Active PHP"
+
+    $active = Get-Active
+
+    if (
+        -not $active.activePath -or
+        [string]::IsNullOrWhiteSpace(
+            [string]$active.activePath
+        )
+    ) {
+
+        Write-Warn "No active PHP selected."
+
+        Write-Host ""
+        Write-Host "Use:"
+        Write-Host "  Switch active PHP"
+
+        return
+    }
+
+    Write-Host "Version:" -ForegroundColor Cyan
+    Write-Host "  $($active.activeVersion)"
+
+    Write-Host ""
+    Write-Host "Path:" -ForegroundColor Cyan
+    Write-Host "  $($active.activePath)"
+
+    Write-Host ""
+
+    if (Test-Path $active.activePath) {
+
+        $actual = Get-PhpVersionFromExecutable `
+            $active.activePath
+
+        if ($actual) {
+
+            Write-OK `
+                "Actual executable reports PHP $actual"
+        }
+        else {
+
+            Write-Err "Active PHP cannot be executed."
+        }
     }
     else {
 
-        $commandName = $requested
+        Write-Err "Active PHP executable does not exist."
+    }
+}
+
+# ============================================================
+# VERIFY COMMAND
+# ============================================================
+
+function Verify-Command {
+
+    Write-Title "Verify PHP Commands"
+
+    Write-Host "Examples:"
+    Write-Host "  php72"
+    Write-Host "  php82"
+    Write-Host "  php"
+    Write-Host "  cmp72"
+    Write-Host ""
+
+    $command = Read-Host "Enter command"
+
+    if ([string]::IsNullOrWhiteSpace($command)) {
+        return
     }
 
     $cmd = Get-Command `
-        $commandName `
+        $command `
         -ErrorAction SilentlyContinue
 
     if (-not $cmd) {
 
-        Write-Err "$commandName was not found in PATH."
-        Write-Info "Make sure $WrapperRoot is in PATH and open a new terminal."
+        Write-Err "'$command' was not found."
+
+        Write-Host ""
+        Write-Host "Wrapper directory:"
+        Write-Host "  $WrapperRoot"
+
+        Write-Host ""
+        Write-Host "Run:"
+        Write-Host "  PATH Manager"
+        Write-Host "  Add to User PATH"
+
         return
     }
 
     Write-Host ""
-    Write-Host "Command:" -ForegroundColor Cyan
-    Write-Host $cmd.Source
+    Write-Host "Resolved command:" `
+        -ForegroundColor Cyan
 
-    $output = & $commandName -v 2>&1
+    Write-Host "  $($cmd.Source)"
 
     Write-Host ""
-    Write-Host $output
+
+    try {
+
+        & $command --version
+    }
+    catch {
+
+        Write-Err $_.Exception.Message
+    }
 }
 
 # ============================================================
@@ -1122,6 +1893,7 @@ function Remove-Php {
     $versions = @(Find-PhpExecutables)
 
     if ($versions.Count -eq 0) {
+
         Write-Warn "No PHP installations found."
         return
     }
@@ -1138,7 +1910,7 @@ function Remove-Php {
 
     Write-Host ""
 
-    $choice = Read-Host "Select version number"
+    $choice = Read-Host "Select version"
 
     if ($choice -notmatch "^\d+$") {
         return
@@ -1146,31 +1918,50 @@ function Remove-Php {
 
     $index = [int]$choice - 1
 
-    if ($index -lt 0 -or $index -ge $versions.Count) {
+    if (
+        $index -lt 0 -or
+        $index -ge $versions.Count
+    ) {
+
         Write-Err "Invalid selection."
         return
     }
 
     $selected = $versions[$index]
 
-    Write-Host ""
-    Write-Host "Selected PHP $($selected.Version)" `
-        -ForegroundColor Yellow
+    $active = Get-Active
 
-    $confirm = Read-Host "Really remove it? [y/N]"
+    if (
+        $active.activePath -and
+        ($active.activePath -ieq $selected.Path)
+    ) {
+
+        Write-Warn "This is the ACTIVE PHP."
+        Write-Warn "Select another PHP before removing it."
+
+        return
+    }
+
+    Write-Host ""
+    Write-Host "Selected:"
+    Write-Host "  PHP $($selected.Version)"
+    Write-Host "  $($selected.Path)"
+
+    $confirm = Read-Host `
+        "Really remove this PHP? [y/N]"
 
     if ($confirm -notmatch "^[Yy]$") {
         return
     }
 
-    $installPath = Split-Path `
-        $selected.Path `
-        -Parent
-
     try {
 
+        $installPath = Split-Path `
+            $selected.Path `
+            -Parent
+
         Remove-Item `
-            $installPath `
+            -Path $installPath `
             -Recurse `
             -Force
 
@@ -1181,13 +1972,14 @@ function Remove-Php {
         $registry.installations = @(
             $registry.installations |
             Where-Object {
-                $_.path -ne $selected.Path
+                $_.path -ine $selected.Path
             }
         )
 
         Save-Registry $registry
 
-        $short = Get-ShortVersion $selected.Version
+        $short = Get-ShortVersion `
+            $selected.Version
 
         if ($short) {
 
@@ -1200,11 +1992,17 @@ function Remove-Php {
                 "cmp$short.bat"
 
             if (Test-Path $phpWrapper) {
-                Remove-Item $phpWrapper -Force
+
+                Remove-Item `
+                    $phpWrapper `
+                    -Force
             }
 
             if (Test-Path $cmpWrapper) {
-                Remove-Item $cmpWrapper -Force
+
+                Remove-Item `
+                    $cmpWrapper `
+                    -Force
             }
         }
 
@@ -1217,45 +2015,173 @@ function Remove-Php {
 }
 
 # ============================================================
-# REBUILD ALL WRAPPERS
+# PATH
 # ============================================================
 
-function Rebuild-Wrappers {
+function Add-ToPath {
 
-    Write-Title "Rebuilding PHP Wrappers"
+    param(
+        [ValidateSet("User", "Machine")]
+        [string]$Scope = "User"
+    )
 
-    $versions = @(Find-PhpExecutables)
+    $current = [Environment]::GetEnvironmentVariable(
+        "Path",
+        $Scope
+    )
 
-    if ($versions.Count -eq 0) {
+    $entries = @()
 
-        Write-Warn "No PHP installations found."
-        return
+    if ($current) {
+
+        $entries = @(
+            $current -split ";" |
+            Where-Object {
+                -not [string]::IsNullOrWhiteSpace($_)
+            }
+        )
     }
 
-    foreach ($php in $versions) {
-
-        $actual = Get-PhpVersionFromExecutable `
-            $php.Path
-
-        if (-not $actual) {
-            Write-Warn "Could not verify $($php.Path)"
-            continue
+    $already = $entries |
+        Where-Object {
+            $_.TrimEnd("\") -ieq
+            $WrapperRoot.TrimEnd("\")
         }
 
-        New-PhpWrapper `
-            -PhpPath $php.Path `
-            -Version $actual
+    if ($already) {
 
-        New-ComposerWrapper `
-            -PhpPath $php.Path `
-            -Version $actual
+        Write-Warn `
+            "$WrapperRoot is already in $Scope PATH."
+    }
+    else {
+
+        $newPath = (
+            @($entries) + $WrapperRoot
+        ) -join ";"
+
+        try {
+
+            [Environment]::SetEnvironmentVariable(
+                "Path",
+                $newPath,
+                $Scope
+            )
+
+            Write-OK `
+                "Added $WrapperRoot to $Scope PATH."
+        }
+        catch {
+
+            Write-Err $_.Exception.Message
+
+            if ($Scope -eq "Machine") {
+
+                Write-Warn `
+                    "Run PowerShell as Administrator."
+            }
+
+            return
+        }
     }
 
-    Write-OK "Wrappers rebuilt."
+    # --------------------------------------------------------
+    # Update CURRENT PowerShell session
+    # --------------------------------------------------------
+
+    try {
+
+        $userPath = [Environment]::GetEnvironmentVariable(
+            "Path",
+            "User"
+        )
+
+        $machinePath = [Environment]::GetEnvironmentVariable(
+            "Path",
+            "Machine"
+        )
+
+        $parts = @()
+
+        if ($machinePath) {
+            $parts += $machinePath
+        }
+
+        if ($userPath) {
+            $parts += $userPath
+        }
+
+        $env:Path = (
+            $parts -join ";"
+        )
+    }
+    catch {}
+
+    Write-OK "Current PowerShell PATH refreshed."
+
+    Write-Host ""
+    Write-Host "You can now try:"
+    Write-Host "  php72 -v"
+    Write-Host "  php85 -v"
+    Write-Host "  php -v"
+    Write-Host "  cmp72 --version"
+}
+
+function Path-Menu {
+
+    Write-Title "PATH Manager"
+
+    Write-Host "1. Add to User PATH"
+    Write-Host "2. Add to Machine PATH"
+    Write-Host "3. Refresh current PowerShell PATH"
+    Write-Host "4. Show wrapper path"
+    Write-Host "5. Back"
+
+    Write-Host ""
+
+    $choice = Read-Host "Select"
+
+    switch ($choice) {
+
+        "1" {
+            Add-ToPath -Scope User
+        }
+
+        "2" {
+            Add-ToPath -Scope Machine
+        }
+
+        "3" {
+
+            $user = [Environment]::GetEnvironmentVariable(
+                "Path",
+                "User"
+            )
+
+            $machine = [Environment]::GetEnvironmentVariable(
+                "Path",
+                "Machine"
+            )
+
+            $env:Path = "$machine;$user"
+
+            Write-OK "Current PowerShell PATH refreshed."
+        }
+
+        "4" {
+
+            Write-Host ""
+            Write-Host "Wrapper directory:"
+            Write-Host $WrapperRoot
+        }
+
+        "5" {
+            return
+        }
+    }
 }
 
 # ============================================================
-# SYSTEM INFORMATION
+# SYSTEM INFO
 # ============================================================
 
 function Show-SystemInfo {
@@ -1274,14 +2200,20 @@ function Show-SystemInfo {
     Write-Host "  $env:PROCESSOR_ARCHITECTURE"
 
     Write-Host ""
-    Write-Host "Manager root:"
+    Write-Host "Manager:"
     Write-Host "  $ManagerRoot"
 
     Write-Host ""
-    Write-Host "Wrapper directory:"
+    Write-Host "Versions:"
+    Write-Host "  $VersionRoot"
+
+    Write-Host ""
+    Write-Host "Wrappers:"
     Write-Host "  $WrapperRoot"
 
     Write-Host ""
+
+    Show-ActivePhp
 }
 
 # ============================================================
@@ -1294,17 +2226,21 @@ function Show-MainMenu {
 
         Write-Title "PHP Version Manager"
 
-        Write-Host "Manager: $ManagerRoot" -ForegroundColor Gray
+        Write-Host "Manager: $ManagerRoot" `
+            -ForegroundColor Gray
+
         Write-Host ""
 
         Write-Host "1. List installed PHP versions"
         Write-Host "2. Install / download PHP version"
-        Write-Host "3. Remove PHP version"
-        Write-Host "4. Verify phpXX command"
-        Write-Host "5. Rebuild phpXX / cmpXX wrappers"
-        Write-Host "6. PATH manager"
-        Write-Host "7. System information"
-        Write-Host "8. Exit"
+        Write-Host "3. Switch active PHP"
+        Write-Host "4. Show active PHP"
+        Write-Host "5. Remove PHP version"
+        Write-Host "6. Verify phpXX / php / cmpXX"
+        Write-Host "7. Rebuild phpXX / cmpXX wrappers"
+        Write-Host "8. PATH manager"
+        Write-Host "9. System information"
+        Write-Host "10. Exit"
 
         Write-Host ""
 
@@ -1321,32 +2257,44 @@ function Show-MainMenu {
             }
 
             "3" {
-                Remove-Php
+                Switch-ActivePhp
             }
 
             "4" {
-                Verify-VersionCommand
+                Show-ActivePhp
             }
 
             "5" {
-                Rebuild-Wrappers
+                Remove-Php
             }
 
             "6" {
-                Path-Menu
+                Verify-Command
             }
 
             "7" {
-                Show-SystemInfo
+                Rebuild-Wrappers
             }
 
             "8" {
+                Path-Menu
+            }
+
+            "9" {
+                Show-SystemInfo
+            }
+
+            "10" {
+
                 Write-Host ""
-                Write-Host "Goodbye." -ForegroundColor Cyan
+                Write-Host "Goodbye." `
+                    -ForegroundColor Cyan
+
                 return
             }
 
             default {
+
                 Write-Warn "Invalid option."
             }
         }
@@ -1361,5 +2309,9 @@ function Show-MainMenu {
 # ============================================================
 
 Initialize-Manager
+
+# Always ensure active wrappers exist
+New-ActivePhpWrapper
+New-ActiveComposerWrapper
 
 Show-MainMenu
