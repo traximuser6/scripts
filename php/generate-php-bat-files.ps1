@@ -86,26 +86,86 @@ function Get-Registry {
     try {
         $raw = Get-Content -LiteralPath $RegistryFile -Raw
         if ([string]::IsNullOrWhiteSpace($raw)) {
-            return [PSCustomObject]@{ installations = @() }
+            return [PSCustomObject]@{ 
+                installations = @() 
+                updatedAt = (Get-Date).ToString("o")
+            }
         }
         
         $data = $raw | ConvertFrom-Json
+        
+        # FIX: Ensure installations property exists
         if ($null -eq $data.installations) {
-            $data | Add-Member NoteProperty installations @()
+            $data | Add-Member -NotePropertyName installations -NotePropertyValue @() -Force
         }
+        
+        # FIX: Ensure updatedAt property exists
+        if ($null -eq $data.updatedAt) {
+            $data | Add-Member -NotePropertyName updatedAt -NotePropertyValue (Get-Date).ToString("o") -Force
+        }
+        
         return $data
     }
     catch {
         Write-Warn "Invalid registry. Recreating."
-        @{
+        $newRegistry = [PSCustomObject]@{
             installations = @()
             updatedAt = (Get-Date).ToString("o")
-        } | ConvertTo-Json -Depth 30 | Set-Content -LiteralPath $RegistryFile -Encoding UTF8
-        return [PSCustomObject]@{ installations = @() }
+        }
+        $newRegistry | ConvertTo-Json -Depth 30 | Set-Content -LiteralPath $RegistryFile -Encoding UTF8
+        return $newRegistry
     }
 }
 
+function Sync-Registry {
+    $versions = @(Get-CanonicalPhpVersions)
+    $registry = Get-Registry
+    $newItems = New-Object System.Collections.Generic.List[object]
+    
+    foreach ($php in $versions) {
+        $existing = @($registry.installations | Where-Object { $_.path -ieq $php.Path }) | Select-Object -First 1
+        $registeredAt = if ($existing -and $existing.registeredAt) { $existing.registeredAt } else { (Get-Date).ToString("o") }
+        
+        $newItems.Add([PSCustomObject]@{
+            version = $php.Version
+            family = $php.Family
+            path = $php.Path
+            installPath = $php.InstallPath
+            architecture = $php.Architecture
+            threadSafety = $php.ThreadSafety
+            iniPath = $php.IniPath
+            extensionDir = $php.ExtensionDir
+            extensionCount = $php.ExtensionCount
+            registeredAt = $registeredAt
+        }) | Out-Null
+    }
+    
+    # FIX: Update registry properties
+    $registry.installations = $newItems.ToArray()
+    $registry.updatedAt = (Get-Date).ToString("o")
+    
+    # FIX: Ensure property exists before saving
+    if ($null -eq $registry.PSObject.Properties['installations']) {
+        $registry | Add-Member -NotePropertyName installations -NotePropertyValue @() -Force
+    }
+    if ($null -eq $registry.PSObject.Properties['updatedAt']) {
+        $registry | Add-Member -NotePropertyName updatedAt -NotePropertyValue (Get-Date).ToString("o") -Force
+    }
+    
+    Save-Registry $registry
+    return $versions
+}
+
+
 function Save-Registry($Registry) {
+    # Ensure properties exist
+    if ($null -eq $Registry.PSObject.Properties['installations']) {
+        $Registry | Add-Member -NotePropertyName installations -NotePropertyValue @() -Force
+    }
+    if ($null -eq $Registry.PSObject.Properties['updatedAt']) {
+        $Registry | Add-Member -NotePropertyName updatedAt -NotePropertyValue (Get-Date).ToString("o") -Force
+    }
+    
     $Registry | ConvertTo-Json -Depth 30 | Set-Content -LiteralPath $RegistryFile -Encoding UTF8
 }
 
@@ -172,7 +232,7 @@ function Test-VersionMatch([string]$Actual, [string]$Requested) {
 }
 
 function Get-PhpVersion([string]$PhpExe) {
-    if (-not (Test-Path -LiteralPath $PhpExe)) { return $null }
+    if (-not (Test-Path -LiteralPath $PhpExe -PathType Leaf)) { return $null }
     try {
         $v = & $PhpExe -r "echo PHP_VERSION;" 2>$null
         if ($LASTEXITCODE -eq 0 -and $v) {
@@ -184,172 +244,329 @@ function Get-PhpVersion([string]$PhpExe) {
 }
 
 # ============================================================
-# PHP BUILD INFORMATION
-# ============================================================
-function Get-PhpArchitecture([string]$PhpExe) {
-    try {
-        $result = & $PhpExe -r "echo PHP_INT_SIZE;" 2>$null
-        if ($LASTEXITCODE -eq 0) {
-            if ([string]$result -eq "8") { return "x64" }
-            if ([string]$result -eq "4") { return "x86" }
-        }
-    }
-    catch {}
-    return "unknown"
-}
-
-function Get-PhpThreadSafety([string]$PhpExe) {
-    try {
-        $result = & $PhpExe -r "echo defined('PHP_ZTS') && PHP_ZTS ? 'ts' : 'nts';" 2>$null
-        if ($LASTEXITCODE -eq 0 -and $result) {
-            return ([string]$result).Trim().ToLower()
-        }
-    }
-    catch {}
-    return "unknown"
-}
-
-function Get-PhpIniPath([string]$PhpExe) {
-    try {
-        $result = & $PhpExe --ini 2>$null
-        if ($LASTEXITCODE -eq 0 -and $result) {
-            foreach ($line in @($result)) {
-                if ($line -match "Loaded Configuration File:\s*(.+)$") {
-                    $ini = $Matches[1].Trim()
-                    if ($ini -and $ini -ne "(none)") {
-                        return $ini
-                    }
-                }
-            }
-        }
-    }
-    catch {}
-    
-    $fallback = Join-Path (Split-Path $PhpExe -Parent) "php.ini"
-    if (Test-Path -LiteralPath $fallback) { return $fallback }
-    return $null
-}
-
-function Get-PhpExtensionDir([string]$PhpExe) {
-    try {
-        $result = & $PhpExe -r "echo ini_get('extension_dir');" 2>$null
-        if ($LASTEXITCODE -eq 0 -and $result) {
-            return ([string]$result).Trim()
-        }
-    }
-    catch {}
-    return $null
-}
-
-function Get-PhpExtensions([string]$PhpExe) {
-    $extensions = New-Object System.Collections.Generic.List[string]
-    
-    try {
-        $result = & $PhpExe -m 2>$null
-        if ($LASTEXITCODE -eq 0) {
-            $capture = $false
-            foreach ($line in @($result)) {
-                $text = ([string]$line).Trim()
-                if ($text -eq "[PHP Modules]") { $capture = $true; continue }
-                if ($text -eq "[Zend Modules]") { $capture = $false; continue }
-                if ($capture -and $text -and $text -notmatch "^\[") {
-                    $extensions.Add($text.ToLower())
-                }
-            }
-        }
-    }
-    catch {}
-    
-    return @($extensions | Sort-Object -Unique)
-}
-
-# ============================================================
-# PHP PROFILE
+# PHP PROFILE - FIXED VERSION
 # ============================================================
 function New-PhpProfile([string]$PhpPath) {
     $profile = [PSCustomObject]@{
-        Path = $PhpPath
-        Version = $null
-        MajorMinor = $null
-        Architecture = "unknown"
-        ThreadSafety = "unknown"
-        HasIni = $false
-        IniPath = $null
-        ExtensionDir = $null
+        Path             = $PhpPath
+        Version          = $null
+        MajorMinor       = $null
+        Family           = $null
+        Architecture     = "unknown"
+        ThreadSafety     = "unknown"
+        HasIni           = $false
+        IniPath          = $null
+        ExtensionDir     = $null
         LoadedExtensions = @()
-        ExtensionCount = 0
-        IsUsable = $false
+        Extensions       = @()
+        ExtensionCount   = 0
+        IsUsable         = $false
     }
-    
-    if (-not (Test-Path -LiteralPath $PhpPath)) { return $profile }
-    
+
+    if ([string]::IsNullOrWhiteSpace($PhpPath)) {
+        return $profile
+    }
+
+    if (-not (Test-Path -LiteralPath $PhpPath -PathType Leaf)) {
+        return $profile
+    }
+
     $version = Get-PhpVersion $PhpPath
-    if (-not $version) { return $profile }
-    
+
+    if ([string]::IsNullOrWhiteSpace($version)) {
+        return $profile
+    }
+
     $profile.Version = $version
+    $profile.Family = Get-VersionFamily $version
+
     if ($version -match "^(\d+\.\d+)") {
         $profile.MajorMinor = $Matches[1]
     }
-    
+
     try {
         # Thread Safety
-        $thread = & $PhpPath --version 2>$null | Select-String -Pattern "\b(NTS|TS)\b" | Select-Object -First 1
-        if ($thread) {
-            if ($thread.Line -match "\bNTS\b") { $profile.ThreadSafety = "nts" }
-            elseif ($thread.Line -match "\bTS\b") { $profile.ThreadSafety = "ts" }
-        }
-        
-        # Architecture
-        $archOutput = & $PhpPath -r "echo PHP_INT_SIZE;" 2>$null
-        if ($LASTEXITCODE -eq 0) {
-            if ([string]$archOutput -eq "8") { $profile.Architecture = "x64" }
-            elseif ([string]$archOutput -eq "4") { $profile.Architecture = "x86" }
-        }
-        
-        # php.ini
-        $iniOutput = & $PhpPath --ini 2>$null
-        if ($LASTEXITCODE -eq 0 -and $iniOutput) {
-            foreach ($line in @($iniOutput)) {
-                $text = ([string]$line).Trim()
-                if ($text -match "^Loaded Configuration File:\s*(.+)$") {
-                    $ini = $Matches[1].Trim()
-                    if ($ini -and $ini -notmatch "^\(none\)$" -and (Test-Path -LiteralPath $ini)) {
-                        $profile.HasIni = $true
-                        $profile.IniPath = [IO.Path]::GetFullPath($ini)
-                    }
-                }
+        $versionOutput = @(& $PhpPath --version 2>$null)
+
+        foreach ($line in $versionOutput) {
+            $text = ([string]$line).Trim()
+
+            if ($text -match "\bNTS\b") {
+                $profile.ThreadSafety = "nts"
+                break
+            }
+
+            if ($text -match "\bTS\b") {
+                $profile.ThreadSafety = "ts"
+                break
             }
         }
-        
+
+        # Architecture
+        $archOutput = & $PhpPath -r "echo PHP_INT_SIZE;" 2>$null
+
+        if ($LASTEXITCODE -eq 0) {
+            $archText = ([string]$archOutput).Trim()
+
+            if ($archText -eq "8") {
+                $profile.Architecture = "x64"
+            }
+            elseif ($archText -eq "4") {
+                $profile.Architecture = "x86"
+            }
+        }
+
+        # php.ini
+        $iniOutput = @(& $PhpPath --ini 2>$null)
+
+        foreach ($line in $iniOutput) {
+            $text = ([string]$line).Trim()
+
+            if ($text -match "^Loaded Configuration File:\s*(.+)$") {
+                $ini = $Matches[1].Trim()
+
+                if (
+                    $ini -and
+                    $ini -notmatch "^\(none\)$" -and
+                    (Test-Path -LiteralPath $ini -PathType Leaf)
+                ) {
+                    try {
+                        $profile.IniPath = [IO.Path]::GetFullPath($ini)
+                        $profile.HasIni = $true
+                    }
+                    catch {
+                        $profile.IniPath = $ini
+                        $profile.HasIni = $true
+                    }
+                }
+
+                break
+            }
+        }
+
+        # Fallback php.ini beside php.exe
+        if (-not $profile.HasIni) {
+            $fallbackIni = Join-Path (Split-Path $PhpPath -Parent) "php.ini"
+
+            if (Test-Path -LiteralPath $fallbackIni -PathType Leaf) {
+                $profile.HasIni = $true
+                $profile.IniPath = [IO.Path]::GetFullPath($fallbackIni)
+            }
+        }
+
         # Extension Directory
         $extOutput = & $PhpPath -r "echo ini_get('extension_dir');" 2>$null
+
         if ($LASTEXITCODE -eq 0 -and $extOutput) {
             $extDir = ([string]$extOutput).Trim()
+
             if ($extDir) {
                 if (-not [IO.Path]::IsPathRooted($extDir)) {
                     $extDir = Join-Path (Split-Path $PhpPath -Parent) $extDir
                 }
-                if (Test-Path -LiteralPath $extDir) {
+
+                if (Test-Path -LiteralPath $extDir -PathType Container) {
                     $profile.ExtensionDir = [IO.Path]::GetFullPath($extDir)
                 }
             }
         }
-        
+
         # Loaded Extensions
         $extOutput = & $PhpPath -r "echo implode('|', get_loaded_extensions());" 2>$null
+
         if ($LASTEXITCODE -eq 0 -and $extOutput) {
             $extensions = @(
-                ([string]$extOutput) -split "\|" | ForEach-Object { $_.Trim() } | Where-Object { $_ } | Sort-Object -Unique
+                ([string]$extOutput) -split "\|" |
+                ForEach-Object {
+                    $_.Trim()
+                } |
+                Where-Object {
+                    $_ -and $_ -notmatch '^[0-9]+$'
+                } |
+                Sort-Object -Unique
             )
-            $profile.LoadedExtensions = $extensions
-            $profile.ExtensionCount = $extensions.Count
+
+            $profile.LoadedExtensions = @($extensions)
+            $profile.Extensions = @($extensions)
+            $profile.ExtensionCount = @($extensions).Count
         }
-        
+
         $profile.IsUsable = $true
     }
-    catch {}
-    
+    catch {
+        # Profile object already has every required property.
+        # Keep partial information instead of returning a broken object.
+    }
+
     return $profile
+}
+
+# ============================================================
+# PHP DISCOVERY - FIXED VERSION WITH .Add() SUPPRESSED
+# ============================================================
+function Add-PhpResult($List, [string]$Path, [string]$Source) {
+    if ($null -eq $List) {
+        return
+    }
+
+    if ([string]::IsNullOrWhiteSpace($Path)) {
+        return
+    }
+
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) {
+        return
+    }
+
+    try {
+        $full = [IO.Path]::GetFullPath($Path)
+    }
+    catch {
+        return
+    }
+
+    # FIX: Check if path already exists in the list
+    $exists = $false
+    foreach ($existing in $List) {
+        if ($null -ne $existing -and $existing.Path -ieq $full) {
+            $exists = $true
+            break
+        }
+    }
+    
+    if ($exists) {
+        return
+    }
+
+    $profile = New-PhpProfile -PhpPath $full
+
+    if ($null -eq $profile) {
+        return
+    }
+
+    if ([string]::IsNullOrWhiteSpace($profile.Version)) {
+        return
+    }
+
+    $installPath = Split-Path $full -Parent
+
+    $item = [PSCustomObject]@{
+        Version          = $profile.Version
+        Family           = $profile.Family
+        MajorMinor       = $profile.MajorMinor
+        Path             = $full
+        InstallPath      = $installPath
+        Source           = $Source
+        Architecture     = $profile.Architecture
+        ThreadSafety     = $profile.ThreadSafety
+        HasIni           = [bool]$profile.HasIni
+        IniPath          = $profile.IniPath
+        ExtensionDir     = $profile.ExtensionDir
+        LoadedExtensions = @($profile.LoadedExtensions)
+        Extensions       = @($profile.Extensions)
+        ExtensionCount   = [int]$profile.ExtensionCount
+        IsUsable         = [bool]$profile.IsUsable
+    }
+
+    # IMPORTANT: Suppress .Add() return value
+    $List.Add($item) | Out-Null
+}
+
+function Find-PhpExecutables {
+    $results = New-Object System.Collections.Generic.List[object]
+
+    # Registry
+    $registry = Get-Registry
+
+    foreach ($item in @($registry.installations)) {
+        if ($null -eq $item) {
+            continue
+        }
+
+        $path = $item.path
+
+        if (-not [string]::IsNullOrWhiteSpace([string]$path)) {
+            Add-PhpResult -List $results -Path ([string]$path) -Source "Registry"
+        }
+    }
+
+    # Common PHP roots
+    $roots = @(
+        "C:\PHP",
+        "C:\php",
+        "C:\wamp64\bin\php",
+        "C:\wamp\bin\php",
+        "C:\xampp\php",
+        "C:\tools\php",
+        $VersionRoot
+    )
+
+    # PATH directories
+    foreach ($scope in @("User", "Machine")) {
+        try {
+            $p = [Environment]::GetEnvironmentVariable("Path", $scope)
+
+            if (-not [string]::IsNullOrWhiteSpace($p)) {
+                $roots += $p -split ";"
+            }
+        }
+        catch {
+        }
+    }
+
+    # Normalize roots
+    $normalizedRoots = New-Object System.Collections.Generic.List[string]
+
+    foreach ($root in @($roots)) {
+        if ([string]::IsNullOrWhiteSpace([string]$root)) {
+            continue
+        }
+
+        $root = [Environment]::ExpandEnvironmentVariables([string]$root).Trim()
+
+        if (-not (Test-Path -LiteralPath $root -PathType Container)) {
+            continue
+        }
+
+        try {
+            $fullRoot = [IO.Path]::GetFullPath($root)
+
+            if (-not ($normalizedRoots -contains $fullRoot)) {
+                $normalizedRoots.Add($fullRoot) | Out-Null
+            }
+        }
+        catch {
+        }
+    }
+
+    # Scan for php.exe
+    foreach ($root in @($normalizedRoots.ToArray())) {
+        try {
+            $files = Get-ChildItem -LiteralPath $root -Filter "php.exe" -File -Recurse -ErrorAction SilentlyContinue
+
+            foreach ($file in @($files)) {
+                Add-PhpResult -List $results -Path $file.FullName -Source "Scan"
+            }
+        }
+        catch {
+        }
+    }
+
+    # Sort
+    $sorted = @(
+        $results.ToArray() |
+        Sort-Object `
+            @{Expression = {
+                try {
+                    [version]$_.Version
+                }
+                catch {
+                    [version]"0.0.0"
+                }
+            }; Descending = $true},
+            @{Expression = { $_.Path }; Descending = $false}
+    )
+
+    return @($sorted)
 }
 
 # ============================================================
@@ -381,162 +598,205 @@ function Get-InstallationScore($Profile, [string]$Source, [string]$ActivePath) {
     return $score
 }
 
+# ============================================================
+# COMPARE AND SELECT - FIXED VERSION
+# ============================================================
 function Compare-PhpInstallations($A, $B) {
     $differences = New-Object System.Collections.Generic.List[string]
-    
-    if ($A.Version -ne $B.Version) { $differences.Add("version") }
-    if ($A.Architecture -ne $B.Architecture) { $differences.Add("architecture") }
-    if ($A.ThreadSafety -ne $B.ThreadSafety) { $differences.Add("thread-safety") }
-    if ($A.IniPath -ne $B.IniPath) { $differences.Add("php.ini") }
-    if ($A.ExtensionDir -ne $B.ExtensionDir) { $differences.Add("extension-dir") }
-    
+
+    if ($null -eq $A -or $null -eq $B) {
+        $differences.Add("invalid-profile") | Out-Null
+        return @($differences.ToArray())
+    }
+
+    if ($A.Version -ne $B.Version) {
+        $differences.Add("version") | Out-Null
+    }
+
+    if ($A.Architecture -ne $B.Architecture) {
+        $differences.Add("architecture") | Out-Null
+    }
+
+    if ($A.ThreadSafety -ne $B.ThreadSafety) {
+        $differences.Add("thread-safety") | Out-Null
+    }
+
+    if ($A.IniPath -ne $B.IniPath) {
+        $differences.Add("php.ini") | Out-Null
+    }
+
+    if ($A.ExtensionDir -ne $B.ExtensionDir) {
+        $differences.Add("extension-dir") | Out-Null
+    }
+
     $extA = @($A.Extensions | Sort-Object)
     $extB = @($B.Extensions | Sort-Object)
-    $sameExtensions = ((ConvertTo-Json $extA -Compress) -eq (ConvertTo-Json $extB -Compress))
-    if (-not $sameExtensions) { $differences.Add("extensions") }
-    
-    return @($differences)
-}
 
-# ============================================================
-# PHP DISCOVERY
-# ============================================================
-function Add-PhpResult($List, [string]$Path, [string]$Source) {
-    if (-not (Test-Path -LiteralPath $Path)) { return }
-    
-    try { $full = [IO.Path]::GetFullPath($Path) }
-    catch { return }
-    
-    foreach ($existing in $List) {
-        if ($existing.Path -ieq $full) { return }
+    $jsonA = ConvertTo-Json $extA -Compress
+    $jsonB = ConvertTo-Json $extB -Compress
+
+    if ($jsonA -ne $jsonB) {
+        $differences.Add("extensions") | Out-Null
     }
-    
-    $profile = New-PhpProfile -PhpPath $full
-    if (-not $profile.Version) { return }
-    
-    $List.Add([PSCustomObject]@{
-        Version = $profile.Version
-        Path = $full
-        Source = $Source
-        MajorMinor = $profile.MajorMinor
-        Architecture = $profile.Architecture
-        ThreadSafety = $profile.ThreadSafety
-        HasIni = $profile.HasIni
-        IniPath = $profile.IniPath
-        ExtensionDir = $profile.ExtensionDir
-        LoadedExtensions = @($profile.LoadedExtensions)
-        ExtensionCount = $profile.ExtensionCount
-        IsUsable = $profile.IsUsable
-    })
+
+    return @($differences.ToArray())
 }
 
 function Select-CanonicalInstallation($Items) {
-    $active = Get-Active
-    $activePath = $active.activePath
-    
-    $scored = foreach ($item in $Items) {
-        $score = Get-InstallationScore $item $item.Source $activePath
-        [PSCustomObject]@{ Item = $item; Score = $score }
-    }
-    
-    return ($scored | Sort-Object `
-        @{Expression = { $_.Score }; Descending = $true },
-        @{Expression = { try { [version]$_.Item.Version } catch { [version]"0.0.0" } }; Descending = $true },
-        @{Expression = { $_.Item.Path }; Descending = $false }
-    | Select-Object -First 1).Item
-}
-
-function Find-PhpExecutables {
-    $results = New-Object System.Collections.Generic.List[object]
-    
-    # Registry
-    $registry = Get-Registry
-    foreach ($item in @($registry.installations)) {
-        $path = $item.path
-        if ($path) {
-            Add-PhpResult -List $results -Path ([string]$path) -Source "Registry"
+    $itemsArray = @(
+        $Items |
+        Where-Object {
+            $null -ne $_ -and
+            -not [string]::IsNullOrWhiteSpace([string]$_.Path)
         }
-    }
-    
-    # Common PHP roots
-    $roots = @(
-        "C:\PHP",
-        "C:\php",
-        "C:\wamp64\bin\php",
-        "C:\wamp\bin\php",
-        "C:\xampp\php",
-        "C:\tools\php",
-        $VersionRoot
     )
-    
-    # PATH directories
-    foreach ($scope in @("User", "Machine")) {
-        try {
-            $p = [Environment]::GetEnvironmentVariable("Path", $scope)
-            if ($p) { $roots += $p -split ";" }
-        }
-        catch {}
+
+    if ($itemsArray.Count -eq 0) {
+        return $null
     }
-    
-    $roots = @($roots | Where-Object { $_ -and (Test-Path -LiteralPath $_) } | ForEach-Object { try { [IO.Path]::GetFullPath($_) } catch {} } | Sort-Object -Unique)
-    
-    # Scan
-    foreach ($root in $roots) {
-        try {
-            Get-ChildItem -LiteralPath $root -Filter "php.exe" -File -Recurse -ErrorAction SilentlyContinue |
-            ForEach-Object {
-                Add-PhpResult -List $results -Path $_.FullName -Source "Scan"
+
+    $active = Get-Active
+    $activePath = $null
+
+    if ($active) {
+        $activePath = $active.activePath
+    }
+
+    $scored = @(
+        foreach ($item in $itemsArray) {
+            $score = Get-InstallationScore `
+                $item `
+                ([string]$item.Source) `
+                ([string]$activePath)
+
+            [PSCustomObject]@{
+                Item  = $item
+                Score = $score
             }
         }
-        catch {}
-    }
-    
-    return @($results.ToArray() | Sort-Object `
-        @{Expression = { try { [version]$_.Version } catch { [version]"0.0.0" } }; Descending = $true },
-        Path
     )
+
+    $selected = $scored |
+        Sort-Object `
+            @{Expression = { $_.Score }; Descending = $true},
+            @{Expression = {
+                try {
+                    [version]$_.Item.Version
+                }
+                catch {
+                    [version]"0.0.0"
+                }
+            }; Descending = $true},
+            @{Expression = { $_.Item.Path }; Descending = $false} |
+        Select-Object -First 1
+
+    if ($selected) {
+        return $selected.Item
+    }
+
+    return $null
 }
 
+# ============================================================
+# CANONICAL VERSIONS - FIXED WITH ALL PROPERTIES
+# ============================================================
 function Get-CanonicalPhpVersions {
     $all = @(Find-PhpExecutables)
-    if ($all.Count -eq 0) { return @() }
-    
-    $groups = @($all | Group-Object Family)
+
+    if ($all.Count -eq 0) {
+        return @()
+    }
+
+    $groups = @(
+        $all |
+        Where-Object {
+            $null -ne $_ -and
+            -not [string]::IsNullOrWhiteSpace([string]$_.Family)
+        } |
+        Group-Object -Property Family
+    )
+
     $canonical = New-Object System.Collections.Generic.List[object]
-    
-    foreach ($group in $groups) {
-        $items = @($group.Group)
+
+    foreach ($group in @($groups)) {
+        $items = @(
+            $group.Group |
+            Where-Object {
+                $null -ne $_
+            }
+        )
+
+        if ($items.Count -eq 0) {
+            continue
+        }
+
         $selected = Select-CanonicalInstallation $items
-        
-        $duplicates = @($items | Where-Object { $_.Path -ine $selected.Path })
+
+        if ($null -eq $selected) {
+            continue
+        }
+
+        $duplicates = @(
+            $items |
+            Where-Object {
+                $_.Path -ine $selected.Path
+            }
+        )
+
         $conflicts = New-Object System.Collections.Generic.List[string]
-        
-        foreach ($duplicate in $duplicates) {
+
+        foreach ($duplicate in @($duplicates)) {
             $diff = @(Compare-PhpInstallations $selected $duplicate)
+
             if ($diff.Count -gt 0) {
-                $conflicts.Add("$($duplicate.Path): $($diff -join ', ')")
+                $conflicts.Add(
+                    "$($duplicate.Path): $($diff -join ', ')"
+                ) | Out-Null
             }
         }
-        
-        $canonical.Add([PSCustomObject]@{
-            Version = $selected.Version
-            Family = $selected.Family
-            Path = $selected.Path
-            InstallPath = $selected.InstallPath
-            Source = $selected.Source
-            Architecture = $selected.Architecture
-            ThreadSafety = $selected.ThreadSafety
-            IniPath = $selected.IniPath
-            ExtensionDir = $selected.ExtensionDir
-            Extensions = $selected.Extensions
-            ExtensionCount = $selected.ExtensionCount
-            DuplicateCount = $duplicates.Count
-            Duplicates = $duplicates
-            Conflicts = @($conflicts)
-        })
+
+        $canonicalItem = [PSCustomObject]@{
+            Version          = $selected.Version
+            Family           = $selected.Family
+            MajorMinor       = $selected.MajorMinor
+            Path             = $selected.Path
+            InstallPath      = $selected.InstallPath
+            Source           = $selected.Source
+            Architecture     = $selected.Architecture
+            ThreadSafety     = $selected.ThreadSafety
+            HasIni           = [bool]$selected.HasIni
+            IniPath          = $selected.IniPath
+            ExtensionDir     = $selected.ExtensionDir
+            Extensions       = @($selected.Extensions)
+            LoadedExtensions = @($selected.LoadedExtensions)
+            ExtensionCount   = [int]$selected.ExtensionCount
+            DuplicateCount   = $duplicates.Count
+            Duplicates       = @($duplicates)
+            DuplicatePaths   = @(
+                $duplicates |
+                ForEach-Object {
+                    $_.Path
+                }
+            )
+            Conflicts         = @($conflicts.ToArray())
+        }
+
+        $canonical.Add($canonicalItem) | Out-Null
     }
-    
-    return @($canonical | Sort-Object { try { [version]$_.Version } catch { [version]"0.0.0" } } -Descending)
+
+    $sorted = @(
+        $canonical.ToArray() |
+        Sort-Object {
+            try {
+                [version]$_.Version
+            }
+            catch {
+                [version]"0.0.0"
+            }
+        } -Descending
+    )
+
+    return @($sorted)
 }
 
 function Register-Php([string]$PhpPath, [string]$Version, [string]$Architecture = "unknown", [string]$ThreadSafety = "unknown", [string]$InstallPath) {
@@ -583,13 +843,46 @@ function Sync-Registry {
             extensionDir = $php.ExtensionDir
             extensionCount = $php.ExtensionCount
             registeredAt = $registeredAt
-        })
+        }) | Out-Null
     }
     
-    $registry.installations = @($newItems)
-    $registry.updatedAt = (Get-Date).ToString("o")
+    # FIX: Create fresh registry object with all properties
+    $registry = [PSCustomObject]@{
+        installations = $newItems.ToArray()
+        updatedAt = (Get-Date).ToString("o")
+    }
+    
     Save-Registry $registry
     return $versions
+}
+
+
+# ============================================================
+# LEGACY FUNCTIONS (For backward compatibility)
+# ============================================================
+function Get-PhpArchitecture([string]$PhpExe) {
+    $profile = New-PhpProfile $PhpExe
+    return $profile.Architecture
+}
+
+function Get-PhpThreadSafety([string]$PhpExe) {
+    $profile = New-PhpProfile $PhpExe
+    return $profile.ThreadSafety
+}
+
+function Get-PhpIniPath([string]$PhpExe) {
+    $profile = New-PhpProfile $PhpExe
+    return $profile.IniPath
+}
+
+function Get-PhpExtensionDir([string]$PhpExe) {
+    $profile = New-PhpProfile $PhpExe
+    return $profile.ExtensionDir
+}
+
+function Get-PhpExtensions([string]$PhpExe) {
+    $profile = New-PhpProfile $PhpExe
+    return $profile.Extensions
 }
 
 # ============================================================
@@ -870,7 +1163,7 @@ function Rebuild-Wrappers {
 }
 
 # ============================================================
-# COMMANDS
+# COMMANDS - FIXED SHOW-ACTIVEPHP
 # ============================================================
 function Show-InstalledVersions {
     Write-Title "Installed PHP Versions"
@@ -894,8 +1187,8 @@ function Show-InstalledVersions {
         Write-Host "         php.ini    : $(if ($php.HasIni) { $php.IniPath } else { '(none)' })" -ForegroundColor DarkGray
         Write-Host "         Extensions : $($php.ExtensionCount)" -ForegroundColor DarkGray
         
-        if ($php.DuplicateCount -gt 1) {
-            Write-Host "         [INFO] $($php.DuplicateCount) installations detected for this version." -ForegroundColor Yellow
+        if ($php.DuplicateCount -gt 0) {
+            Write-Host "         [INFO] $($php.DuplicateCount) duplicate installation(s) detected." -ForegroundColor Yellow
             foreach ($duplicate in @($php.DuplicatePaths)) {
                 Write-Host "                 duplicate: $duplicate" -ForegroundColor DarkYellow
             }
@@ -943,29 +1236,33 @@ function Switch-ActivePhp {
 
 function Show-ActivePhp {
     Write-Title "Active PHP"
-    
+
     $active = Get-Active
+
     if (-not $active.activePath) {
         Write-Warn "No active PHP selected."
         return
     }
-    
+
     Write-Host "Version : $($active.activeVersion)" -ForegroundColor Cyan
     Write-Host "Path    : $($active.activePath)" -ForegroundColor Gray
-    
-    if (Test-Path -LiteralPath $active.activePath) {
-        $profile = Get-PhpProfile $active.activePath
-        if ($profile) {
-            Write-OK "Executable reports PHP $($profile.Version)"
-            Write-Host "Build   : $($profile.Architecture) / $($profile.ThreadSafety)"
-            Write-Host "Ini     : $($profile.IniPath)"
-            Write-Host "Ext dir : $($profile.ExtensionDir)"
-            Write-Host "Ext     : $($profile.ExtensionCount)"
-        } else {
-            Write-Err "PHP executable could not be profiled."
-        }
-    } else {
+
+    if (-not (Test-Path -LiteralPath $active.activePath -PathType Leaf)) {
         Write-Err "Active PHP executable does not exist."
+        return
+    }
+
+    $profile = New-PhpProfile $active.activePath
+
+    if ($profile -and $profile.IsUsable) {
+        Write-OK "Executable reports PHP $($profile.Version)"
+        Write-Host "Build   : $($profile.Architecture) / $($profile.ThreadSafety)"
+        Write-Host "Ini     : $(if ($profile.HasIni) { $profile.IniPath } else { '(none)' })"
+        Write-Host "Ext dir : $(if ($profile.ExtensionDir) { $profile.ExtensionDir } else { '(none)' })"
+        Write-Host "Ext     : $($profile.ExtensionCount)"
+    }
+    else {
+        Write-Err "PHP executable could not be profiled."
     }
 }
 
@@ -1224,6 +1521,9 @@ function Path-Menu {
     }
 }
 
+# ============================================================
+# INSTALL FUNCTION
+# ============================================================
 function Install-Php {
     Write-Title "Install PHP"
     
