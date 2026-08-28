@@ -94,12 +94,10 @@ function Get-Registry {
         
         $data = $raw | ConvertFrom-Json
         
-        # FIX: Ensure installations property exists
         if ($null -eq $data.installations) {
             $data | Add-Member -NotePropertyName installations -NotePropertyValue @() -Force
         }
         
-        # FIX: Ensure updatedAt property exists
         if ($null -eq $data.updatedAt) {
             $data | Add-Member -NotePropertyName updatedAt -NotePropertyValue (Get-Date).ToString("o") -Force
         }
@@ -117,48 +115,7 @@ function Get-Registry {
     }
 }
 
-function Sync-Registry {
-    $versions = @(Get-CanonicalPhpVersions)
-    $registry = Get-Registry
-    $newItems = New-Object System.Collections.Generic.List[object]
-    
-    foreach ($php in $versions) {
-        $existing = @($registry.installations | Where-Object { $_.path -ieq $php.Path }) | Select-Object -First 1
-        $registeredAt = if ($existing -and $existing.registeredAt) { $existing.registeredAt } else { (Get-Date).ToString("o") }
-        
-        $newItems.Add([PSCustomObject]@{
-            version = $php.Version
-            family = $php.Family
-            path = $php.Path
-            installPath = $php.InstallPath
-            architecture = $php.Architecture
-            threadSafety = $php.ThreadSafety
-            iniPath = $php.IniPath
-            extensionDir = $php.ExtensionDir
-            extensionCount = $php.ExtensionCount
-            registeredAt = $registeredAt
-        }) | Out-Null
-    }
-    
-    # FIX: Update registry properties
-    $registry.installations = $newItems.ToArray()
-    $registry.updatedAt = (Get-Date).ToString("o")
-    
-    # FIX: Ensure property exists before saving
-    if ($null -eq $registry.PSObject.Properties['installations']) {
-        $registry | Add-Member -NotePropertyName installations -NotePropertyValue @() -Force
-    }
-    if ($null -eq $registry.PSObject.Properties['updatedAt']) {
-        $registry | Add-Member -NotePropertyName updatedAt -NotePropertyValue (Get-Date).ToString("o") -Force
-    }
-    
-    Save-Registry $registry
-    return $versions
-}
-
-
 function Save-Registry($Registry) {
-    # Ensure properties exist
     if ($null -eq $Registry.PSObject.Properties['installations']) {
         $Registry | Add-Member -NotePropertyName installations -NotePropertyValue @() -Force
     }
@@ -167,6 +124,204 @@ function Save-Registry($Registry) {
     }
     
     $Registry | ConvertTo-Json -Depth 30 | Set-Content -LiteralPath $RegistryFile -Encoding UTF8
+}
+
+# ============================================================
+# DUPLICATE MANAGEMENT - NEW FUNCTION
+# ============================================================
+function Resolve-DuplicatePhpVersions {
+    param(
+        [Parameter(Mandatory = $true)]
+        [array]$Versions,
+        
+        [Parameter(Mandatory = $true)]
+        [object]$Registry
+    )
+    
+    $duplicatesFound = $false
+    $processedFamilies = @()
+    
+    foreach ($version in $Versions) {
+        $family = $version.Family
+        
+        if ($processedFamilies -contains $family) {
+            continue
+        }
+        $processedFamilies += $family
+        
+        $familyVersions = @($Versions | Where-Object { $_.Family -eq $family })
+        
+        if ($familyVersions.Count -le 1) {
+            continue
+        }
+        
+        $duplicatesFound = $true
+        
+        Write-Title "Duplicate PHP $family Found!"
+        Write-Host "Found $($familyVersions.Count) installations for PHP $family" -ForegroundColor Yellow
+        Write-Host ""
+        
+        for ($i = 0; $i -lt $familyVersions.Count; $i++) {
+            $v = $familyVersions[$i]
+            $marker = if ($v.Path -eq $version.Path) { " [CANONICAL]" } else { "" }
+            Write-Host "[$($i + 1)] $($v.Version)$marker" -ForegroundColor Cyan
+            Write-Host "    Path: $($v.Path)" -ForegroundColor Gray
+            Write-Host "    Build: $($v.Architecture) / $($v.ThreadSafety)" -ForegroundColor Gray
+            Write-Host "    Source: $($v.Source)" -ForegroundColor Gray
+            Write-Host ""
+        }
+        
+        Write-Host "Options:" -ForegroundColor Yellow
+        Write-Host "  1. Keep only canonical version (recommended)" -ForegroundColor Gray
+        Write-Host "  2. Select specific version to keep (remove others)" -ForegroundColor Gray
+        Write-Host "  3. Move all versions to manager (keep all)" -ForegroundColor Gray
+        Write-Host "  4. Skip (keep all as-is)" -ForegroundColor Gray
+        
+        $choice = Read-Host "Select option [1-4]"
+        
+        switch ($choice) {
+            "1" {
+                # Keep only canonical, remove others
+                $canonical = $familyVersions | Sort-Object { Get-InstallationScore $_ $_.Source $null } -Descending | Select-Object -First 1
+                
+                Write-Host ""
+                Write-Warn "Keeping canonical only: $($canonical.Path)"
+                
+                foreach ($v in $familyVersions) {
+                    if ($v.Path -eq $canonical.Path) { continue }
+                    
+                    $confirm = Read-Host "Remove $($v.Path)? [y/N]"
+                    if ($confirm -match "^[Yy]$") {
+                        try {
+                            Remove-Item -LiteralPath $v.InstallPath -Recurse -Force -ErrorAction SilentlyContinue
+                            Write-OK "Removed: $($v.Path)"
+                            
+                            $Registry.installations = @($Registry.installations | Where-Object { $_.path -ine $v.Path })
+                        }
+                        catch {
+                            Write-Err "Could not remove: $($_.Exception.Message)"
+                        }
+                    }
+                }
+            }
+            
+            "2" {
+                $keepIndex = Read-Host "Enter number of version to keep [1-$($familyVersions.Count)]"
+                if ($keepIndex -match "^\d+$") {
+                    $idx = [int]$keepIndex - 1
+                    if ($idx -ge 0 -and $idx -lt $familyVersions.Count) {
+                        $keep = $familyVersions[$idx]
+                        
+                        Write-Host ""
+                        Write-OK "Keeping: $($keep.Path)"
+                        
+                        foreach ($v in $familyVersions) {
+                            if ($v.Path -eq $keep.Path) { continue }
+                            
+                            # Ask if want to move to manager directory
+                            $moveToManager = Read-Host "Move $($v.Path) to manager? [y/N]"
+                            if ($moveToManager -match "^[Yy]$") {
+                                $newPath = Join-Path $VersionRoot $v.Version
+                                try {
+                                    if (Test-Path -LiteralPath $newPath) {
+                                        Remove-Item -LiteralPath $newPath -Recurse -Force
+                                    }
+                                    Move-Item -LiteralPath $v.InstallPath -Destination $newPath -Force
+                                    Write-OK "Moved to: $newPath"
+                                    
+                                    # Update registry with new path
+                                    $Registry.installations = @($Registry.installations | Where-Object { $_.path -ine $v.Path })
+                                    $Registry.installations += [PSCustomObject]@{
+                                        version = $v.Version
+                                        family = $v.Family
+                                        path = Join-Path $newPath "php.exe"
+                                        installPath = $newPath
+                                        architecture = $v.Architecture
+                                        threadSafety = $v.ThreadSafety
+                                        iniPath = $v.IniPath
+                                        extensionDir = $v.ExtensionDir
+                                        extensionCount = $v.ExtensionCount
+                                        registeredAt = (Get-Date).ToString("o")
+                                    }
+                                }
+                                catch {
+                                    Write-Err "Could not move: $($_.Exception.Message)"
+                                }
+                            }
+                            else {
+                                $confirm = Read-Host "Remove $($v.Path)? [y/N]"
+                                if ($confirm -match "^[Yy]$") {
+                                    try {
+                                        Remove-Item -LiteralPath $v.InstallPath -Recurse -Force -ErrorAction SilentlyContinue
+                                        Write-OK "Removed: $($v.Path)"
+                                        $Registry.installations = @($Registry.installations | Where-Object { $_.path -ine $v.Path })
+                                    }
+                                    catch {
+                                        Write-Err "Could not remove: $($_.Exception.Message)"
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            
+            "3" {
+                # Move all to manager
+                Write-Host ""
+                Write-Info "Moving all PHP $family versions to manager..."
+                
+                foreach ($v in $familyVersions) {
+                    $newPath = Join-Path $VersionRoot $v.Version
+                    if ($v.Path -like "$VersionRoot\*") { 
+                        Write-Info "Already in manager: $($v.Path)"
+                        continue 
+                    }
+                    
+                    try {
+                        if (Test-Path -LiteralPath $newPath) {
+                            Remove-Item -LiteralPath $newPath -Recurse -Force
+                        }
+                        Move-Item -LiteralPath $v.InstallPath -Destination $newPath -Force
+                        Write-OK "Moved to: $newPath"
+                        
+                        $Registry.installations = @($Registry.installations | Where-Object { $_.path -ine $v.Path })
+                        $Registry.installations += [PSCustomObject]@{
+                            version = $v.Version
+                            family = $v.Family
+                            path = Join-Path $newPath "php.exe"
+                            installPath = $newPath
+                            architecture = $v.Architecture
+                            threadSafety = $v.ThreadSafety
+                            iniPath = $v.IniPath
+                            extensionDir = $v.ExtensionDir
+                            extensionCount = $v.ExtensionCount
+                            registeredAt = (Get-Date).ToString("o")
+                        }
+                    }
+                    catch {
+                        Write-Err "Could not move: $($_.Exception.Message)"
+                    }
+                }
+            }
+            
+            "4" {
+                Write-Info "Skipping duplicate resolution for PHP $family"
+            }
+            
+            default {
+                Write-Warn "Invalid option. Skipping..."
+            }
+        }
+        
+        Write-Host ""
+    }
+    
+    if (-not $duplicatesFound) {
+        Write-OK "No duplicate PHP versions found."
+    }
+    
+    return $Registry
 }
 
 # ============================================================
@@ -244,7 +399,7 @@ function Get-PhpVersion([string]$PhpExe) {
 }
 
 # ============================================================
-# PHP PROFILE - FIXED VERSION
+# PHP PROFILE
 # ============================================================
 function New-PhpProfile([string]$PhpPath) {
     $profile = [PSCustomObject]@{
@@ -285,7 +440,6 @@ function New-PhpProfile([string]$PhpPath) {
     }
 
     try {
-        # Thread Safety
         $versionOutput = @(& $PhpPath --version 2>$null)
 
         foreach ($line in $versionOutput) {
@@ -302,7 +456,6 @@ function New-PhpProfile([string]$PhpPath) {
             }
         }
 
-        # Architecture
         $archOutput = & $PhpPath -r "echo PHP_INT_SIZE;" 2>$null
 
         if ($LASTEXITCODE -eq 0) {
@@ -316,7 +469,6 @@ function New-PhpProfile([string]$PhpPath) {
             }
         }
 
-        # php.ini
         $iniOutput = @(& $PhpPath --ini 2>$null)
 
         foreach ($line in $iniOutput) {
@@ -344,7 +496,6 @@ function New-PhpProfile([string]$PhpPath) {
             }
         }
 
-        # Fallback php.ini beside php.exe
         if (-not $profile.HasIni) {
             $fallbackIni = Join-Path (Split-Path $PhpPath -Parent) "php.ini"
 
@@ -354,7 +505,6 @@ function New-PhpProfile([string]$PhpPath) {
             }
         }
 
-        # Extension Directory
         $extOutput = & $PhpPath -r "echo ini_get('extension_dir');" 2>$null
 
         if ($LASTEXITCODE -eq 0 -and $extOutput) {
@@ -371,7 +521,6 @@ function New-PhpProfile([string]$PhpPath) {
             }
         }
 
-        # Loaded Extensions
         $extOutput = & $PhpPath -r "echo implode('|', get_loaded_extensions());" 2>$null
 
         if ($LASTEXITCODE -eq 0 -and $extOutput) {
@@ -394,15 +543,14 @@ function New-PhpProfile([string]$PhpPath) {
         $profile.IsUsable = $true
     }
     catch {
-        # Profile object already has every required property.
-        # Keep partial information instead of returning a broken object.
+        # Keep partial information
     }
 
     return $profile
 }
 
 # ============================================================
-# PHP DISCOVERY - FIXED VERSION WITH .Add() SUPPRESSED
+# PHP DISCOVERY
 # ============================================================
 function Add-PhpResult($List, [string]$Path, [string]$Source) {
     if ($null -eq $List) {
@@ -424,7 +572,6 @@ function Add-PhpResult($List, [string]$Path, [string]$Source) {
         return
     }
 
-    # FIX: Check if path already exists in the list
     $exists = $false
     foreach ($existing in $List) {
         if ($null -ne $existing -and $existing.Path -ieq $full) {
@@ -467,14 +614,12 @@ function Add-PhpResult($List, [string]$Path, [string]$Source) {
         IsUsable         = [bool]$profile.IsUsable
     }
 
-    # IMPORTANT: Suppress .Add() return value
     $List.Add($item) | Out-Null
 }
 
 function Find-PhpExecutables {
     $results = New-Object System.Collections.Generic.List[object]
 
-    # Registry
     $registry = Get-Registry
 
     foreach ($item in @($registry.installations)) {
@@ -489,7 +634,6 @@ function Find-PhpExecutables {
         }
     }
 
-    # Common PHP roots
     $roots = @(
         "C:\PHP",
         "C:\php",
@@ -500,7 +644,6 @@ function Find-PhpExecutables {
         $VersionRoot
     )
 
-    # PATH directories
     foreach ($scope in @("User", "Machine")) {
         try {
             $p = [Environment]::GetEnvironmentVariable("Path", $scope)
@@ -513,7 +656,6 @@ function Find-PhpExecutables {
         }
     }
 
-    # Normalize roots
     $normalizedRoots = New-Object System.Collections.Generic.List[string]
 
     foreach ($root in @($roots)) {
@@ -538,7 +680,6 @@ function Find-PhpExecutables {
         }
     }
 
-    # Scan for php.exe
     foreach ($root in @($normalizedRoots.ToArray())) {
         try {
             $files = Get-ChildItem -LiteralPath $root -Filter "php.exe" -File -Recurse -ErrorAction SilentlyContinue
@@ -551,7 +692,6 @@ function Find-PhpExecutables {
         }
     }
 
-    # Sort
     $sorted = @(
         $results.ToArray() |
         Sort-Object `
@@ -599,7 +739,7 @@ function Get-InstallationScore($Profile, [string]$Source, [string]$ActivePath) {
 }
 
 # ============================================================
-# COMPARE AND SELECT - FIXED VERSION
+# COMPARE AND SELECT
 # ============================================================
 function Compare-PhpInstallations($A, $B) {
     $differences = New-Object System.Collections.Generic.List[string]
@@ -698,7 +838,7 @@ function Select-CanonicalInstallation($Items) {
 }
 
 # ============================================================
-# CANONICAL VERSIONS - FIXED WITH ALL PROPERTIES
+# CANONICAL VERSIONS
 # ============================================================
 function Get-CanonicalPhpVersions {
     $all = @(Find-PhpExecutables)
@@ -826,6 +966,10 @@ function Register-Php([string]$PhpPath, [string]$Version, [string]$Architecture 
 function Sync-Registry {
     $versions = @(Get-CanonicalPhpVersions)
     $registry = Get-Registry
+    
+    # Check for duplicates and resolve them
+    $registry = Resolve-DuplicatePhpVersions -Versions $versions -Registry $registry
+    
     $newItems = New-Object System.Collections.Generic.List[object]
     
     foreach ($php in $versions) {
@@ -846,19 +990,15 @@ function Sync-Registry {
         }) | Out-Null
     }
     
-    # FIX: Create fresh registry object with all properties
-    $registry = [PSCustomObject]@{
-        installations = $newItems.ToArray()
-        updatedAt = (Get-Date).ToString("o")
-    }
+    $registry.installations = $newItems.ToArray()
+    $registry.updatedAt = (Get-Date).ToString("o")
     
     Save-Registry $registry
     return $versions
 }
 
-
 # ============================================================
-# LEGACY FUNCTIONS (For backward compatibility)
+# LEGACY FUNCTIONS
 # ============================================================
 function Get-PhpArchitecture([string]$PhpExe) {
     $profile = New-PhpProfile $PhpExe
@@ -1163,7 +1303,7 @@ function Rebuild-Wrappers {
 }
 
 # ============================================================
-# COMMANDS - FIXED SHOW-ACTIVEPHP
+# COMMANDS
 # ============================================================
 function Show-InstalledVersions {
     Write-Title "Installed PHP Versions"
